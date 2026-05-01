@@ -1,6 +1,6 @@
 use anyhow::{ensure, Result};
 
-use crate::dataset::top_k_by_score;
+use crate::metrics::top_k_by_score;
 use crate::quantization::turboquant::{TurboQuantQuery, TurboQuantizer};
 use crate::quantization::VectorQuantizer;
 

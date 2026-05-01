@@ -1,5 +1,3 @@
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,6 +8,8 @@ use arrow::array::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+pub const COHERE_DIMS: usize = 768;
+
 pub struct Dataset {
     pub docs: Vec<Vec<f32>>,
     pub doc_ids: Vec<u64>,
@@ -17,38 +17,7 @@ pub struct Dataset {
     pub ground_truth: Vec<Vec<u64>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ScoredDoc {
-    score: f32,
-    id: u64,
-}
-
-impl Eq for ScoredDoc {}
-
-impl PartialOrd for ScoredDoc {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ScoredDoc {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .partial_cmp(&other.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| self.id.cmp(&other.id))
-    }
-}
-
-pub fn load_cohere(
-    dataset_dir: &Path,
-    n: usize,
-    dims: usize,
-    num_queries: usize,
-    k: usize,
-    normalize: bool,
-    fetch: bool,
-) -> Result<Dataset> {
+pub fn load_cohere(dataset_dir: &Path, doc_limit: Option<usize>, fetch: bool) -> Result<Dataset> {
     if fetch {
         ensure_cohere_dataset(dataset_dir)?;
     }
@@ -56,82 +25,26 @@ pub fn load_cohere(
         &dataset_dir.join("shuffle_train.parquet"),
         "id",
         "emb",
-        dims,
-        n,
+        COHERE_DIMS,
+        doc_limit,
     )?;
     let mut queries = read_vector_parquet(
         &dataset_dir.join("test.parquet"),
         "id",
         "emb",
-        dims,
-        num_queries,
+        COHERE_DIMS,
+        None,
     )?;
-    if normalize {
-        normalize_all(&mut docs.vectors);
-        normalize_all(&mut queries.vectors);
-    }
-    let ground_truth = read_neighbors_parquet(
-        &dataset_dir.join("neighbors.parquet"),
-        "neighbors_id",
-        num_queries,
-        k,
-    )?;
+    normalize_all(&mut docs.vectors);
+    normalize_all(&mut queries.vectors);
+    let ground_truth =
+        read_neighbors_parquet(&dataset_dir.join("neighbors.parquet"), "neighbors_id")?;
     Ok(Dataset {
         docs: docs.vectors,
         doc_ids: docs.ids,
         queries: queries.vectors,
         ground_truth,
     })
-}
-
-pub fn top_k_by_score<I>(scores: I, k: usize) -> Vec<(u64, f32)>
-where
-    I: IntoIterator<Item = (u64, f32)>,
-{
-    let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k + 1);
-    for (id, score) in scores {
-        let candidate = Reverse(ScoredDoc { score, id });
-        if heap.len() < k {
-            heap.push(candidate);
-        } else if let Some(worst) = heap.peek() {
-            if candidate.0 > worst.0 {
-                heap.pop();
-                heap.push(candidate);
-            }
-        }
-    }
-    let mut top: Vec<_> = heap
-        .into_iter()
-        .map(|Reverse(scored)| (scored.id, scored.score))
-        .collect();
-    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-    top
-}
-
-pub fn metrics_for(ground_truth_ids: &[u64], got_ranked: &[(u64, f32)], k: usize) -> (f32, f32) {
-    let gt: Vec<u64> = ground_truth_ids.iter().copied().take(k).collect();
-    let gt_set: std::collections::HashSet<u64> = gt.iter().copied().collect();
-    let hits = got_ranked
-        .iter()
-        .take(k)
-        .filter(|(id, _)| gt_set.contains(id))
-        .count();
-    let recall = hits as f32 / k as f32;
-    let dcg = got_ranked
-        .iter()
-        .take(k)
-        .enumerate()
-        .filter_map(|(rank, (id, _))| {
-            gt_set
-                .contains(id)
-                .then_some(1.0f32 / ((rank + 2) as f32).log2())
-        })
-        .sum::<f32>();
-    let ideal = (0..gt.len())
-        .map(|rank| 1.0f32 / ((rank + 2) as f32).log2())
-        .sum::<f32>();
-    let ndcg = if ideal > 0.0 { dcg / ideal } else { 0.0 };
-    (recall, ndcg)
 }
 
 struct VectorRows {
@@ -166,13 +79,13 @@ fn read_vector_parquet(
     id_col: &str,
     vector_col: &str,
     dims: usize,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<VectorRows> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mut reader = builder.with_batch_size(8192).build()?;
-    let mut ids = Vec::with_capacity(limit);
-    let mut vectors = Vec::with_capacity(limit);
+    let mut ids = Vec::with_capacity(limit.unwrap_or(0));
+    let mut vectors = Vec::with_capacity(limit.unwrap_or(0));
     while let Some(batch) = reader.next() {
         let batch = batch?;
         let id_idx = batch
@@ -186,7 +99,7 @@ fn read_vector_parquet(
         let id_array = batch.column(id_idx);
         let vec_array = batch.column(vec_idx);
         for row in 0..batch.num_rows() {
-            if ids.len() >= limit {
+            if limit.is_some_and(|limit| ids.len() >= limit) {
                 return Ok(VectorRows { ids, vectors });
             }
             ids.push(read_u64_scalar(id_array.as_ref(), row)?);
@@ -194,26 +107,23 @@ fn read_vector_parquet(
             vectors.push(vec);
         }
     }
-    if ids.len() != limit {
-        bail!(
-            "expected {limit} rows from {}, got {}",
-            path.display(),
-            ids.len()
-        );
+    if let Some(limit) = limit {
+        if ids.len() != limit {
+            bail!(
+                "expected {limit} rows from {}, got {}",
+                path.display(),
+                ids.len()
+            );
+        }
     }
     Ok(VectorRows { ids, vectors })
 }
 
-fn read_neighbors_parquet(
-    path: &Path,
-    neighbors_col: &str,
-    limit: usize,
-    k: usize,
-) -> Result<Vec<Vec<u64>>> {
+fn read_neighbors_parquet(path: &Path, neighbors_col: &str) -> Result<Vec<Vec<u64>>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mut reader = builder.with_batch_size(8192).build()?;
-    let mut out = Vec::with_capacity(limit);
+    let mut out = Vec::new();
     while let Some(batch) = reader.next() {
         let batch = batch?;
         let idx = batch
@@ -222,20 +132,8 @@ fn read_neighbors_parquet(
             .with_context(|| format!("missing column {neighbors_col}"))?;
         let array = batch.column(idx);
         for row in 0..batch.num_rows() {
-            if out.len() >= limit {
-                return Ok(out);
-            }
-            let mut ids = read_u64_list(array.as_ref(), row)?;
-            ids.truncate(k);
-            out.push(ids);
+            out.push(read_u64_list(array.as_ref(), row)?);
         }
-    }
-    if out.len() != limit {
-        bail!(
-            "expected {limit} rows from {}, got {}",
-            path.display(),
-            out.len()
-        );
     }
     Ok(out)
 }

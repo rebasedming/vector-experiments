@@ -1,3 +1,5 @@
+pub mod experiment;
+pub mod factory;
 pub mod math;
 pub mod naivesq;
 pub mod rabitq;
@@ -6,7 +8,7 @@ pub mod turboquant;
 
 use anyhow::Result;
 
-use crate::dataset::top_k_by_score;
+use crate::metrics::top_k_by_score;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Metric {
@@ -39,6 +41,9 @@ impl From<std::io::Error> for VectorError {
 
 pub trait VectorQuantizer {
     fn name(&self) -> &'static str;
+    fn variant(&self) -> &'static str {
+        "default"
+    }
     fn bits(&self) -> u8;
     fn encode(&mut self, docs: &[Vec<f32>]) -> Result<()>;
     fn score(&self, query: &[f32], doc_idx: usize) -> f32;

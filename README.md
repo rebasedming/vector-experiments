@@ -1,29 +1,36 @@
 # vector-experiments
 
-Standalone Rust experiments for comparing vector quantization recall and compression.
+Standalone Rust experiments over the VectorDBBench Cohere 1M dataset.
 
-The current benchmark targets the VectorDBBench Cohere 1M dataset and compares:
+The repo is structured around a generic experiment runner. Each experiment owns
+its CLI arguments, work loop, measurements, and output format.
 
-- `turboquant`
-- `rabitq`
-- `naivesq` (per-dimension min/max scalar quantization)
+## Experiments
 
-All three quantizers implement the shared `VectorQuantizer` trait in `src/quantization/mod.rs`.
+Experiments live as folders/modules under `src/`. The generic harness in
+`src/main.rs` loads the Cohere dataset once, selects the requested experiment
+from the CLI, and then delegates the actual work to that experiment.
 
-## Layout
+To add a new experiment:
 
-```text
-src/
-  dataset.rs
-  main.rs
-  quantization/
-    naivesq/
-    rabitq/
-    turboquant/
+1. Create a new module folder under `src/`, for example `src/my_experiment/`.
+2. Define a clap args struct for the experiment, usually with `#[derive(Debug, Args)]`.
+3. Implement the `Experiment` trait from `src/experiment.rs`:
+
+```rust
+pub trait Experiment {
+    fn name(&self) -> &'static str;
+    fn run(&self, data: &Dataset) -> Result<ExperimentOutput>;
+}
 ```
 
-`rabitq` and `turboquant` are lifted from the Tantivy vector experiments. `naivesq`
-is the simple calibrated scalar baseline.
+4. Return results through `ExperimentOutput`, which owns the CSV header and rows.
+5. Add a variant to `ExperimentKind` in `src/experiment.rs`, then dispatch it in
+   `ExperimentKind::into_experiment`.
+
+Experiment-specific implementation details and CLI flags should stay inside the
+experiment module. The top-level CLI should remain limited to dataset loading
+and experiment selection.
 
 ## Dataset
 
@@ -41,37 +48,17 @@ test.parquet
 neighbors.parquet
 ```
 
-If the files are missing, pass `--fetch` to download them from VectorDBBench's
-public asset path:
+The loader uses Cohere's fixed 768 dimensions and normalizes vectors for
+inner-product/cosine evaluation.
 
-```sh
-cargo run --release -- --fetch --n 1000000 --queries 100
-```
+If the files are missing, pass `--fetch` to download them from VectorDBBench's
+public asset path.
 
 You can also point at an existing directory:
 
 ```sh
-cargo run --release -- --dataset-dir /path/to/cohere_medium_1m
+cargo run --release -- --dataset-dir /path/to/cohere_medium_1m <experiment>
 ```
 
-## Examples
-
-Run all quantizers at the default bit widths:
-
-```sh
-cargo run --release -- --quantizer all --bits 4,5,6,8 --k 10,50,100 --n 1000000 --queries 100
-```
-
-Run the zero-centroid RaBitQ sweep:
-
-```sh
-cargo run --release -- --quantizer rabitq --bits 1,2,3,4,5,6,8 --k 10,50,100 --n 1000000 --queries 100
-```
-
-Output is CSV on stdout:
-
-```text
-method,bits,bytes_per_vector,compression_x,k,recall,ndcg,encode_seconds,query_seconds,qps
-```
-
-Status/progress messages are printed to stderr.
+Status/progress messages are printed to stderr. Experiment results are printed
+to stdout.

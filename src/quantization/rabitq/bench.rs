@@ -1,28 +1,52 @@
 use anyhow::{ensure, Result};
 
-use crate::dataset::top_k_by_score;
+use crate::metrics::top_k_by_score;
 use crate::quantization::rabitq::{
-    bytes_per_record, encode, prepare_query, DynamicRotator, Metric, RabitqConfig, RotatorType,
+    bytes_per_record, prepare_query, quantizer, record, DynamicRotator, Metric, RabitqConfig,
+    RotatorType,
 };
 use crate::quantization::VectorQuantizer;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RabitqVariant {
+    Fixed,
+    Optimal,
+}
+
+impl RabitqVariant {
+    pub fn name(self) -> &'static str {
+        match self {
+            RabitqVariant::Fixed => "fixed",
+            RabitqVariant::Optimal => "optimal",
+        }
+    }
+}
 
 pub struct RabitqBench {
     dims: usize,
     bits: u8,
     padded_dims: usize,
     rotator: DynamicRotator,
+    variant: RabitqVariant,
+    config: RabitqConfig,
     records: Vec<Vec<u8>>,
 }
 
 impl RabitqBench {
-    pub fn new(dims: usize, bits: u8, seed: u64) -> Self {
+    pub fn new(dims: usize, bits: u8, seed: u64, variant: RabitqVariant) -> Self {
         let rotator = DynamicRotator::new(dims, RotatorType::FhtKacRotator, seed);
         let padded_dims = rotator.padded_dim();
+        let config = match variant {
+            RabitqVariant::Fixed => RabitqConfig::faster(padded_dims, bits as usize, seed),
+            RabitqVariant::Optimal => RabitqConfig::new(bits as usize),
+        };
         Self {
             dims,
             bits,
             padded_dims,
             rotator,
+            variant,
+            config,
             records: Vec::new(),
         }
     }
@@ -33,24 +57,28 @@ impl VectorQuantizer for RabitqBench {
         "rabitq"
     }
 
+    fn variant(&self) -> &'static str {
+        self.variant.name()
+    }
+
     fn bits(&self) -> u8 {
         self.bits
     }
 
     fn encode(&mut self, docs: &[Vec<f32>]) -> Result<()> {
         ensure!((1..=16).contains(&self.bits), "rabitq supports bits 1..=16");
-        let zero_centroid = vec![0.0f32; self.dims];
-        let config = RabitqConfig::new(self.bits as usize);
+        let rotated_zero_centroid = vec![0.0f32; self.padded_dims];
         self.records = docs
             .iter()
             .map(|doc| {
-                encode(
-                    &self.rotator,
-                    &config,
+                let rotated = self.rotator.rotate(doc);
+                let qv = quantizer::quantize_with_centroid(
+                    &rotated,
+                    &rotated_zero_centroid,
+                    &self.config,
                     Metric::InnerProduct,
-                    doc,
-                    &zero_centroid,
-                )
+                );
+                record::pack(&qv)
             })
             .collect();
         Ok(())
