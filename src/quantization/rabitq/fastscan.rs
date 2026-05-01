@@ -401,6 +401,7 @@ pub fn batch_data_size(dim_bytes: usize) -> usize {
 /// without unpacking to u16 first. Works on the C++-compatible packed format.
 ///
 /// For ex_bits=2: each 4 bytes encode 16 values (2 bits each).
+/// For ex_bits=4: each byte encodes two values (low nibble, then high nibble).
 /// For ex_bits=6: each 12 bytes encode 16 values (6 bits each).
 pub fn ip_packed_ex_f32(
     query: &[f32],
@@ -410,6 +411,7 @@ pub fn ip_packed_ex_f32(
 ) -> f32 {
     match ex_bits {
         2 => ip_packed_ex2_f32(query, packed_ex_code, padded_dim),
+        4 => ip_packed_ex4_f32(query, packed_ex_code, padded_dim),
         6 => ip_packed_ex6_f32_scalar(query, packed_ex_code, padded_dim),
         _ => {
             let ex_code =
@@ -443,6 +445,72 @@ fn ip_packed_ex2_f32(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) ->
     }
 
     ip_packed_ex2_f32_scalar(query, packed_ex_code, padded_dim)
+}
+
+fn ip_packed_ex4_f32(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                return ip_packed_ex4_f32_neon(query, packed_ex_code, padded_dim);
+            }
+        }
+    }
+
+    ip_packed_ex4_f32_scalar(query, packed_ex_code, padded_dim)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn ip_packed_ex4_f32_neon(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
+    let mask = vdup_n_u8(0x0F);
+
+    let chunks = padded_dim / 16;
+    let mut query_ptr = query.as_ptr();
+    let mut code_ptr = packed_ex_code.as_ptr();
+
+    for _ in 0..chunks {
+        let bytes = vld1_u8(code_ptr);
+        let low = vand_u8(bytes, mask);
+        let high = vshr_n_u8::<4>(bytes);
+        let lo_interleaved = vzip1_u8(low, high);
+        let hi_interleaved = vzip2_u8(low, high);
+        let codes_u8 = vcombine_u8(lo_interleaved, hi_interleaved);
+
+        let codes_lo_u16 = vmovl_u8(vget_low_u8(codes_u8));
+        let codes_hi_u16 = vmovl_u8(vget_high_u8(codes_u8));
+        let c0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(codes_lo_u16)));
+        let c1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(codes_lo_u16)));
+        let c2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(codes_hi_u16)));
+        let c3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(codes_hi_u16)));
+
+        let q0 = vld1q_f32(query_ptr);
+        let q1 = vld1q_f32(query_ptr.add(4));
+        let q2 = vld1q_f32(query_ptr.add(8));
+        let q3 = vld1q_f32(query_ptr.add(12));
+
+        sum0 = vfmaq_f32(sum0, c0, q0);
+        sum1 = vfmaq_f32(sum1, c1, q1);
+        sum2 = vfmaq_f32(sum2, c2, q2);
+        sum3 = vfmaq_f32(sum3, c3, q3);
+
+        query_ptr = query_ptr.add(16);
+        code_ptr = code_ptr.add(8);
+    }
+
+    let mut total = vaddvq_f32(vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3)));
+    let start = chunks * 16;
+    for dim in start..padded_dim {
+        let byte = *packed_ex_code.get_unchecked(dim / 2);
+        let code = if dim % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        total += code as f32 * *query.get_unchecked(dim);
+    }
+    total
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -585,6 +653,22 @@ fn ip_packed_ex2_f32_scalar(query: &[f32], packed_ex_code: &[u8], padded_dim: us
     sum
 }
 
+fn ip_packed_ex4_f32_scalar(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
+    let mut sum = 0.0f32;
+    for (byte_idx, &byte) in packed_ex_code
+        .iter()
+        .enumerate()
+        .take(padded_dim.div_ceil(2))
+    {
+        let dim = byte_idx * 2;
+        sum += (byte & 0x0F) as f32 * query[dim];
+        if dim + 1 < padded_dim {
+            sum += (byte >> 4) as f32 * query[dim + 1];
+        }
+    }
+    sum
+}
+
 fn ip_packed_ex6_f32_scalar(query: &[f32], packed_ex_code: &[u8], padded_dim: usize) -> f32 {
     let mut sum = 0.0f32;
     let mut code_idx = 0;
@@ -692,6 +776,26 @@ mod tests {
         assert!(
             (expected - result).abs() < 1e-4,
             "expected={expected} got={result}"
+        );
+    }
+
+    #[test]
+    fn test_ex4_packed_dot_matches_unpacked_dot() {
+        let dim = 64;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) / 17.0 - 1.5).collect();
+        let codes: Vec<u16> = (0..dim).map(|i| ((i * 7 + 3) & 0x0F) as u16).collect();
+        let mut packed = vec![0u8; dim * 4 / 8];
+        super::super::simd::pack_ex_code(&codes, &mut packed, dim, 4);
+
+        let expected: f32 = codes
+            .iter()
+            .zip(query.iter())
+            .map(|(&code, &q)| code as f32 * q)
+            .sum();
+        let got = ip_packed_ex_f32(&query, &packed, dim, 4);
+        assert!(
+            (expected - got).abs() < 1e-4,
+            "expected={expected} got={got}"
         );
     }
 

@@ -71,6 +71,7 @@ impl Experiment for QuantizationRecallExperiment {
             "variant",
             "bits",
             "bytes_per_vector",
+            "total_bytes",
             "compression_x",
             "k",
             "recall",
@@ -119,6 +120,7 @@ impl Experiment for QuantizationRecallExperiment {
                 );
 
                 let bytes = quantizer.bytes_per_vector();
+                let total_bytes = bytes * data.docs.len();
                 let compression = compression_ratio(self.dims, bytes);
                 for &k in &self.k {
                     let per_query: Vec<_> = ranked_by_query
@@ -132,6 +134,7 @@ impl Experiment for QuantizationRecallExperiment {
                         quantizer.variant().to_string(),
                         quantizer.bits().to_string(),
                         bytes.to_string(),
+                        total_bytes.to_string(),
                         format!("{compression:.2}"),
                         k.to_string(),
                         format!("{:.4}", avg.recall),

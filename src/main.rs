@@ -49,7 +49,7 @@ fn main() -> Result<()> {
     let data = load_cohere(&dataset_dir, args.limit, args.fetch)?;
 
     eprintln!("running experiment: {}", experiment.name());
-    experiment.run(&data)?.print_csv();
+    experiment.run(&data)?.print_table();
 
     Ok(())
 }

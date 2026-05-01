@@ -28,9 +28,9 @@
 //! On `aarch64`, the hot path uses two specialized kernels:
 //!   * `stage2_dot_neon`: 8 floats per byte via XOR-with-sign-mask (lookup-driven, branchless). 4
 //!     accumulators for ILP.
-//!   * `stage1_dot_b4_neon`: only for `bit_width == 4` (3-bit Stage 1 indices, 8-level codebook).
-//!     Decodes 8 indices from 3 bytes via bitfield extracts, scalar-gathers the codebook, FMAs into
-//!     4 NEON accumulators.
+//!   * `stage1_dot_b4_neon` / `stage1_dot_b5_neon`: specialized Stage 1 kernels for 3-bit and
+//!     4-bit Stage 1 indices. They decode packed indices, scalar-gather the codebook, then FMA into
+//!     NEON accumulators.
 //!
 //! Other bit widths fall back to the scalar path. Production usage is
 //! pinned at `b=4` in pg_search, so the fast path covers it.
@@ -89,13 +89,13 @@ impl TurboQuantQuery {
         let s1_levels = if bw > 1 { 1usize << (bw - 1) } else { 0 };
         let codebook_ref = quantizer.codebook();
 
-        // SIMD selection: we have a NEON Stage 1 kernel for b=4 only,
+        // SIMD selection: we have NEON Stage 1 kernels for b=4 and b=5,
         // and a NEON Stage 2 kernel for any bit width with d % 8 == 0.
         // We enable SIMD whenever Stage 2 (which always runs) can be
         // vectorized. Stage 1 takes the SIMD path only when both
         // conditions hold; otherwise it falls back to the scalar LUT.
         let stage2_simd_ok = cfg!(target_arch = "aarch64") && quantizer.padded_dim % 8 == 0;
-        let stage1_simd_ok = stage2_simd_ok && bw == 4;
+        let stage1_simd_ok = stage2_simd_ok && (bw == 4 || bw == 5);
         let use_simd = stage2_simd_ok;
 
         let codebook: Vec<f32> = if stage1_simd_ok {
@@ -241,6 +241,10 @@ impl TurboQuantQuery {
             let s1 = stage1_bytes(record, d, bw);
             let cb: &[f32; 8] = self.codebook.as_slice().try_into().unwrap_unchecked();
             ip = neon::stage1_dot_b4_neon(s1, &self.rotated_query, cb, d);
+        } else if bw == 5 {
+            let s1 = stage1_bytes(record, d, bw);
+            let cb: &[f32; 16] = self.codebook.as_slice().try_into().unwrap_unchecked();
+            ip = neon::stage1_dot_b5_neon(s1, &self.rotated_query, cb, d);
         } else if bw > 1 {
             // Shouldn't happen given current SIMD-selection rules, but
             // keep a safety net.
@@ -539,6 +543,82 @@ mod neon {
         let s = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
         vaddvq_f32(s)
     }
+
+    /// Stage 1 for `bit_width == 5`: 4-bit stage-1 indices, two
+    /// MSB-first nibbles per byte. We process 16 coordinates per loop.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn stage1_dot_b5_neon(
+        s1: &[u8],
+        rotated_q: &[f32],
+        cb: &[f32; 16],
+        d: usize,
+    ) -> f32 {
+        debug_assert_eq!(d % 16, 0, "stage1_dot_b5_neon expects d divisible by 16");
+        debug_assert!(s1.len() * 2 >= d, "stage1_dot_b5_neon: s1 too short");
+
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let qptr = rotated_q.as_ptr();
+        let cb_ptr = cb.as_ptr();
+
+        for chunk in 0..(d / 16) {
+            let s_off = chunk * 8;
+            let base = chunk * 16;
+            let b0 = *s1.get_unchecked(s_off);
+            let b1 = *s1.get_unchecked(s_off + 1);
+            let b2 = *s1.get_unchecked(s_off + 2);
+            let b3 = *s1.get_unchecked(s_off + 3);
+            let b4 = *s1.get_unchecked(s_off + 4);
+            let b5 = *s1.get_unchecked(s_off + 5);
+            let b6 = *s1.get_unchecked(s_off + 6);
+            let b7 = *s1.get_unchecked(s_off + 7);
+
+            let cv0 = [
+                *cb_ptr.add((b0 >> 4) as usize),
+                *cb_ptr.add((b0 & 0x0F) as usize),
+                *cb_ptr.add((b1 >> 4) as usize),
+                *cb_ptr.add((b1 & 0x0F) as usize),
+            ];
+            let cv1 = [
+                *cb_ptr.add((b2 >> 4) as usize),
+                *cb_ptr.add((b2 & 0x0F) as usize),
+                *cb_ptr.add((b3 >> 4) as usize),
+                *cb_ptr.add((b3 & 0x0F) as usize),
+            ];
+            let cv2 = [
+                *cb_ptr.add((b4 >> 4) as usize),
+                *cb_ptr.add((b4 & 0x0F) as usize),
+                *cb_ptr.add((b5 >> 4) as usize),
+                *cb_ptr.add((b5 & 0x0F) as usize),
+            ];
+            let cv3 = [
+                *cb_ptr.add((b6 >> 4) as usize),
+                *cb_ptr.add((b6 & 0x0F) as usize),
+                *cb_ptr.add((b7 >> 4) as usize),
+                *cb_ptr.add((b7 & 0x0F) as usize),
+            ];
+
+            let c0 = vld1q_f32(cv0.as_ptr());
+            let c1 = vld1q_f32(cv1.as_ptr());
+            let c2 = vld1q_f32(cv2.as_ptr());
+            let c3 = vld1q_f32(cv3.as_ptr());
+            let q0 = vld1q_f32(qptr.add(base));
+            let q1 = vld1q_f32(qptr.add(base + 4));
+            let q2 = vld1q_f32(qptr.add(base + 8));
+            let q3 = vld1q_f32(qptr.add(base + 12));
+
+            acc0 = vfmaq_f32(acc0, c0, q0);
+            acc1 = vfmaq_f32(acc1, c1, q1);
+            acc2 = vfmaq_f32(acc2, c2, q2);
+            acc3 = vfmaq_f32(acc3, c3, q3);
+        }
+
+        let s = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        vaddvq_f32(s)
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +693,19 @@ mod tests {
             avg_recall >= 0.5,
             "recall@10 below sanity floor: {avg_recall}"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_b5_matches_scalar() {
+        let tq = TurboQuantizer::new(256, Some(5), Some(42));
+        let doc = unit_rand(256, 11);
+        let query = unit_rand(256, 12);
+        let record = tq.encode(&doc);
+        let tqq = TurboQuantQuery::new(&tq, &query);
+        let neon = tqq.estimate_ip(&record);
+        let scalar = tqq.estimate_ip_scalar(&record);
+        assert!((neon - scalar).abs() < 1e-4, "neon={neon} scalar={scalar}");
     }
 
     /// Ignored experiment: isolate TurboQuant recall loss by comparing
