@@ -8,7 +8,8 @@ Implemented quantizers:
 
 - `turboquant`: https://arxiv.org/abs/2504.19874
 - `rabitq`: https://arxiv.org/abs/2405.12497
-- `naivesq`: A simple scalar quantizer that ...
+- `naivesq`: A simple scalar quantizer that learns per-dimension min/max
+  ranges from the corpus and uniformly quantizes each coordinate.
 
 ## Results
 
@@ -31,6 +32,8 @@ On `rabitq`, note that it is encoded against a zero centroid to line up with Tur
   per-vector optimization.
 
 Surprisingly, and contrary to the Turboquant paper, we have a variant of Rabitq which beats Turboquant on both recall and encode time.
+
+Also, note that "naive SQ" looks good because it is dataset aware (min/max ranges are factored into the quantization).
 
 ## Usage
 
