@@ -1,17 +1,15 @@
 //! BLAS dispatch.
 //!
-//! On macOS we link Apple Accelerate (`accelerate-src` crate at the binary
-//! level) and call its CBLAS sgemm directly. Apple Accelerate auto-dispatches
-//! to AMX on M-series silicon, matching the SuperKMeans macOS build which
-//! prioritises Accelerate via CMake.
-//!
-//! On other platforms we fall back to `matrixmultiply::sgemm`, which is what
-//! the C++ also uses when neither MKL nor a system BLAS is present (their
-//! CMake builds OpenBLAS from source as a final fallback; for our experiments
-//! crate we avoid that build complexity).
+//! - **macOS**: Apple Accelerate (auto-dispatches AMX on Apple Silicon) via
+//!   `accelerate-src` linking + manual `cblas_sgemm` FFI.
+//! - **Linux aarch64**: system OpenBLAS (apt: `libopenblas-dev`) via
+//!   `openblas-src` linking + the same `cblas_sgemm` FFI. On Graviton4 /
+//!   Neoverse-V2 this gets us SVE2 sgemm kernels.
+//! - **Other targets**: pure-Rust `matrixmultiply::sgemm`. Cross-platform
+//!   but NEON/AVX-only, no SVE2 / AMX.
 
-#[cfg(target_os = "macos")]
-mod accelerate {
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
+mod cblas {
     pub const CBLAS_ROW_MAJOR: i32 = 101;
     pub const CBLAS_NO_TRANS: i32 = 111;
     pub const CBLAS_TRANS: i32 = 112;
@@ -66,9 +64,9 @@ pub fn sgemm_row_major(
 ) {
     debug_assert!(c.len() >= m * ldc);
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
     {
-        use accelerate::*;
+        use cblas::*;
         let cblas_trans_a = match trans_a {
             Trans::No => CBLAS_NO_TRANS,
             Trans::Yes => CBLAS_TRANS,
@@ -98,7 +96,7 @@ pub fn sgemm_row_major(
         return;
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64"))))]
     {
         // Map (trans_a, trans_b, lda, ldb) into matrixmultiply's (rsa,csa,rsb,csb).
         let (rsa, csa) = match trans_a {

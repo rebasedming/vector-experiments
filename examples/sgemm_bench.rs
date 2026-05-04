@@ -7,8 +7,11 @@ use std::time::Instant;
 #[cfg(target_os = "macos")]
 extern crate accelerate_src;
 
-#[cfg(target_os = "macos")]
-mod accel {
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+extern crate openblas_src;
+
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
+mod cblas {
     pub const CBLAS_ROW_MAJOR: i32 = 101;
     pub const CBLAS_NO_TRANS: i32 = 111;
     pub const CBLAS_TRANS: i32 = 112;
@@ -28,12 +31,12 @@ mod accel {
 #[allow(clippy::too_many_arguments)]
 fn sgemm_x_yT(n: usize, k: usize, d: usize, x: &[f32], y: &[f32], tmp: &mut [f32]) {
     // tmp[N,K] = X[N,D] * Y^T[D,K] (Y given as row-major K x D).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
     unsafe {
-        accel::cblas_sgemm(
-            accel::CBLAS_ROW_MAJOR,
-            accel::CBLAS_NO_TRANS,
-            accel::CBLAS_TRANS,
+        cblas::cblas_sgemm(
+            cblas::CBLAS_ROW_MAJOR,
+            cblas::CBLAS_NO_TRANS,
+            cblas::CBLAS_TRANS,
             n as i32, k as i32, d as i32,
             1.0,
             x.as_ptr(), d as i32,
@@ -43,7 +46,7 @@ fn sgemm_x_yT(n: usize, k: usize, d: usize, x: &[f32], y: &[f32], tmp: &mut [f32
         );
         return;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64"))))]
     unsafe {
         matrixmultiply::sgemm(
             n, d, k,
@@ -86,8 +89,10 @@ fn run(label: &str, n: usize, k: usize, d: usize) {
 fn main() {
     let backend = if cfg!(target_os = "macos") {
         "Apple Accelerate (auto-AMX)"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "OpenBLAS (system, SVE2 kernels)"
     } else {
-        "matrixmultiply (NEON, no SVE2)"
+        "matrixmultiply (pure-Rust NEON/AVX)"
     };
     println!("Backend: {backend}");
 

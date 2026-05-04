@@ -18,6 +18,12 @@ serde = { version = "1", features = ["derive"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = "0.3"
 
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+# Link against the system OpenBLAS (apt: libopenblas-dev). On Graviton4 /
+# Neoverse-V2 this gets us SVE2 sgemm kernels, vs ~13× slower NEON-only
+# matrixmultiply.
+openblas-src = { version = "0.10", default-features = false, features = ["system", "cblas"] }
+
 [[example]]
 name = "sgemm_bench"
 path = "examples/sgemm_bench.rs"
