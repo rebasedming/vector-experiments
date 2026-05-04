@@ -159,8 +159,17 @@ impl Experiment for KMeansExperiment {
                 ]);
             }
 
+            // With --superkmeans we use the pruning fast-path
+            // (assign_training_points), which on non-AMX hardware can be
+            // dramatically faster than brute-force; without the flag we fall
+            // back to brute-force `assign` (the pruning ratios assume the
+            // rotation has been applied, so they're not valid otherwise).
             let t_assign = Instant::now();
-            let primary = km.assign(&flat, &centroids, n, self.k);
+            let primary = if self.superkmeans {
+                km.assign_training_points(&flat, &centroids, n, self.k)
+            } else {
+                km.assign(&flat, &centroids, n, self.k)
+            };
             assign_ms = t_assign.elapsed().as_secs_f64() * 1000.0;
             (centroids, primary)
         };
@@ -190,9 +199,10 @@ impl Experiment for KMeansExperiment {
             format!("{:.1}", train_ms),
         ]);
         if assign_ms > 0.0 {
+            let method = if self.superkmeans { "pruned" } else { "brute" };
             output.push_row([
                 "ASSIGN".to_string(),
-                format!("brute, k={}", self.k),
+                format!("{}, k={}", method, self.k),
                 String::new(),
                 String::new(),
                 String::new(),
