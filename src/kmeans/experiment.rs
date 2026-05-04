@@ -99,8 +99,11 @@ impl Experiment for KMeansExperiment {
         ]);
 
         // -------- 1. Train: produce centroids + primary assignments --------
-        let train_start = Instant::now();
+        let mut setup_ms = 0.0f64;
+        let mut train_ms = 0.0f64;
+        let mut assign_ms = 0.0f64;
         let (centroids, primary_assignments): (Vec<f32>, Vec<u32>) = if self.hierarchical {
+            let t = Instant::now();
             let (c, a) = hierarchical_balanced_kmeans(
                 &flat,
                 n,
@@ -109,6 +112,7 @@ impl Experiment for KMeansExperiment {
                 self.hierarchical_iters_per_bisect,
                 self.seed,
             );
+            train_ms = t.elapsed().as_secs_f64() * 1000.0;
             output.push_row([
                 "HIERARCH".to_string(),
                 format!("levels={}", (self.k as f32).log2().ceil() as u32),
@@ -134,8 +138,14 @@ impl Experiment for KMeansExperiment {
                 verbose: self.verbose,
                 ..SuperKMeansConfig::default()
             };
+            let t_setup = Instant::now();
             let mut km = SuperKMeans::new(self.k, dims, cfg);
+            setup_ms = t_setup.elapsed().as_secs_f64() * 1000.0;
+
+            let t_train = Instant::now();
             let centroids = km.train(&flat, n, None, 0);
+            train_ms = t_train.elapsed().as_secs_f64() * 1000.0;
+
             for stat in &km.iteration_stats {
                 output.push_row([
                     stat.iteration.to_string(),
@@ -148,14 +158,27 @@ impl Experiment for KMeansExperiment {
                     format!("{:.1}", stat.duration_ms),
                 ]);
             }
-            // Brute-force assign for the primary corpus assignments.
+
+            let t_assign = Instant::now();
             let primary = km.assign(&flat, &centroids, n, self.k);
+            assign_ms = t_assign.elapsed().as_secs_f64() * 1000.0;
             (centroids, primary)
         };
-        let train_ms = train_start.elapsed().as_secs_f64() * 1000.0;
 
         // -------- 2. Primary balance summary --------
         let primary_balance = SuperKMeans::cluster_balance_stats(&primary_assignments, n, self.k);
+        if setup_ms > 0.0 {
+            output.push_row([
+                "SETUP".to_string(),
+                "pruner+buffers".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                format!("{:.1}", setup_ms),
+            ]);
+        }
         output.push_row([
             "TRAIN".to_string(),
             format!("n={}", n),
@@ -166,6 +189,18 @@ impl Experiment for KMeansExperiment {
             String::new(),
             format!("{:.1}", train_ms),
         ]);
+        if assign_ms > 0.0 {
+            output.push_row([
+                "ASSIGN".to_string(),
+                format!("brute, k={}", self.k),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                format!("{:.1}", assign_ms),
+            ]);
+        }
 
         // -------- 3. Boundary duplication (optional) --------
         let dup_enabled = self.duplicate_max > 1 && self.duplicate_ratio > 1.0;
@@ -226,7 +261,7 @@ impl Experiment for KMeansExperiment {
             output.push_extra(section);
         }
 
-        let total_ms = train_ms + dup_ms;
+        let total_ms = setup_ms + train_ms + assign_ms + dup_ms;
         output.push_row([
             "TOTAL".to_string(),
             String::new(),
