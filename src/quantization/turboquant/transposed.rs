@@ -1,9 +1,5 @@
-//! Per-cluster 16-doc transposed layout for batched SIMD scoring.
-//!
-//! Hot path is `bit_width = 4` (3-bit Stage 1 indices, 1-bit Stage 2
-//! signs). Other widths fall through to the doc-major scorer in
-//! `distance.rs` — the `cluster` plugin only emits the transposed
-//! layout when `bit_width == 4`.
+//! Per-cluster 16-doc transposed layout for batched SIMD scoring (**5-bit**
+//! TurboQuant only: 4-bit Stage 1 indices per nibble + 1-bit Stage 2 signs).
 //!
 //! ## Layout (per 16-doc batch, padded_dim = D)
 //!
@@ -63,20 +59,15 @@ use super::record::{read_norm, stage1_bytes, stage2_bytes};
 /// whole batch's stage-1 codebook gather.
 pub const BATCH_DOCS: usize = 16;
 
-/// Default bit width when callers don't specify (matches historic
-/// behavior — 3-bit stage 1 codebook + 1-bit stage 2 sign).
-pub const TRANSPOSED_BIT_WIDTH: u8 = 4;
+/// Default / only bit width for the transposed batch encoder (`BIT_WIDTH`).
+pub const TRANSPOSED_BIT_WIDTH: u8 = super::quantizer::BIT_WIDTH;
 
-/// Bit widths the transposed batched SIMD kernel can score directly.
-/// Both fit one stage-1 index per nibble, so the same `vqtbl1q_s8`
-/// kernel works for either:
-///   * b4: 3 bits/slot (top nibble bit = 0), 8-entry codebook
-///   * b5: 4 bits/slot (full nibble), 16-entry codebook
-pub const SUPPORTED_BIT_WIDTHS: [u8; 2] = [4, 5];
+/// Width supported by the transposed SIMD batch path (matches [`TRANSPOSED_BIT_WIDTH`]).
+pub const SUPPORTED_BIT_WIDTHS: [u8; 1] = [TRANSPOSED_BIT_WIDTH];
 
 #[inline]
 pub fn is_supported_bit_width(bw: u8) -> bool {
-    SUPPORTED_BIT_WIDTHS.contains(&bw)
+    bw == TRANSPOSED_BIT_WIDTH
 }
 
 /// Number of stage-1 codebook entries for the given bit width:
@@ -87,7 +78,7 @@ pub fn codebook_levels(bit_width: u8) -> usize {
 }
 
 /// Legacy alias for the b4 codebook size (= 8).
-pub const TRANSPOSED_CODEBOOK_LEVELS: usize = 8;
+pub const TRANSPOSED_CODEBOOK_LEVELS: usize = 16;
 
 /// Stage-1 transposed slab bytes per batch: one 4-bit slot per
 /// (doc, coord) pair, 16 docs per coord = 8 B/coord.
@@ -899,10 +890,6 @@ mod tests {
     use rand_distr::{Distribution, Normal};
 
     use super::*;
-    use crate::quantization::turboquant::recall_experiment::{
-        exact_top_k, load_experiment_data, metrics_for, print_metric_summary, top_k_by_score,
-        ExperimentConfig,
-    };
     use crate::quantization::turboquant::{TurboQuantQuery, TurboQuantizer};
 
     fn unit(d: usize, seed: u64) -> Vec<f32> {
@@ -922,7 +909,7 @@ mod tests {
     #[test]
     fn batched_scalar_matches_per_doc() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
 
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 1_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
@@ -955,7 +942,7 @@ mod tests {
     #[test]
     fn batched_simd_close_to_per_doc() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
 
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 2_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
@@ -992,7 +979,7 @@ mod tests {
     #[test]
     fn extract_record_roundtrips_through_encode_batch() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 7_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
@@ -1019,7 +1006,7 @@ mod tests {
     #[test]
     fn extract_record_partial_batch() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         let vecs: Vec<Vec<f32>> = (0..7).map(|i| unit(d, 8_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
@@ -1058,7 +1045,7 @@ mod tests {
     #[test]
     fn split_stage1_finish_matches_score_batch() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 4_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
         let rec_refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
@@ -1092,7 +1079,7 @@ mod tests {
     #[test]
     fn upper_bound_dominates_actual_score() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         // Use 10 different random batches to exercise the bound across
         // varying gamma magnitudes and stage-2 sign patterns.
         for trial in 0..10 {
@@ -1129,7 +1116,7 @@ mod tests {
     #[test]
     fn b5_round_trip_matches_per_doc() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(5), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         assert_eq!(tq.bit_width, 5);
 
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 5_000 + i as u64)).collect();
@@ -1170,7 +1157,7 @@ mod tests {
     #[test]
     fn b5_ranking_matches_per_doc() {
         let d = 768;
-        let tq = TurboQuantizer::new(d, Some(5), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
 
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| unit(d, 7_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
@@ -1230,7 +1217,7 @@ mod tests {
         let d = 768usize;
         let n = 60_000usize;
 
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         let recs: Vec<Vec<u8>> = (0..n)
             .map(|i| tq.encode(&unit(d, 1_000 + i as u64)))
             .collect();
@@ -1296,9 +1283,8 @@ mod tests {
         );
     }
 
-    /// Ignored experiment: isolate recall effects from the production
-    /// transposed batch layout and scorer, without centroids, windows,
-    /// segment readers, or collector pruning.
+    /// Superseded by the shared `quantization-recall` CLI experiment.
+    #[cfg(any())]
     #[test]
     #[ignore]
     fn experiment_transposed_bruteforce_recall() {
@@ -1306,7 +1292,7 @@ mod tests {
         let data = load_experiment_data(&cfg);
         assert_eq!(data.docs.len(), cfg.n);
 
-        let tq = TurboQuantizer::new(cfg.dims, Some(cfg.bit_width), Some(cfg.seed));
+        let tq = TurboQuantizer::new(cfg.dims, Some(cfg.seed));
         assert!(
             is_supported_bit_width(tq.bit_width),
             "transposed experiment supports bit widths {:?}, got {}",
@@ -1378,7 +1364,7 @@ mod tests {
         let d = 768;
         let n = 256;
         let k = 10;
-        let tq = TurboQuantizer::new(d, Some(TRANSPOSED_BIT_WIDTH), Some(42));
+        let tq = TurboQuantizer::new(d, Some(42));
         let vecs: Vec<Vec<f32>> = (0..n).map(|i| unit(d, 5_000 + i as u64)).collect();
         let recs: Vec<Vec<u8>> = vecs.iter().map(|v| tq.encode(v)).collect();
 

@@ -3,7 +3,7 @@ use clap::ValueEnum;
 
 use crate::quantization::naivesq::NaiveSqQuantizer;
 use crate::quantization::rabitq::bench::{RabitqBench, RabitqVariant};
-use crate::quantization::turboquant::bench::TurboQuantBench;
+use crate::quantization::turboquant::bench::{TurboQuantBench, TurboQuantVariant};
 use crate::quantization::VectorQuantizer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -22,6 +22,8 @@ pub enum QuantizerVariant {
     Fixed,
     /// Use per-vector optimal quantization parameters where supported.
     Optimal,
+    /// Use the dense Gaussian QJL projection from the TurboQuant paper where supported.
+    GaussianQjl,
     /// Run every variant supported by the selected quantizer.
     All,
 }
@@ -37,20 +39,22 @@ pub fn selected_quantizers(
     variant: QuantizerVariant,
 ) -> Result<Vec<QuantizerSpec>> {
     match kind {
-        QuantizerKind::Turboquant => default_only(kind, variant),
+        QuantizerKind::Turboquant => turboquant_specs(variant),
         QuantizerKind::Rabitq => rabitq_specs(variant),
         QuantizerKind::Naivesq => default_only(kind, variant),
         QuantizerKind::All => {
             let mut specs = Vec::new();
-            specs.extend(default_only(
-                QuantizerKind::Turboquant,
-                QuantizerVariant::Default,
-            )?);
-            specs.extend(rabitq_specs(variant)?);
-            specs.extend(default_only(
-                QuantizerKind::Naivesq,
-                QuantizerVariant::Default,
-            )?);
+            specs.extend(turboquant_specs(match variant {
+                QuantizerVariant::All => QuantizerVariant::All,
+                QuantizerVariant::GaussianQjl => QuantizerVariant::GaussianQjl,
+                _ => QuantizerVariant::Default,
+            })?);
+            specs.extend(rabitq_specs(match variant {
+                QuantizerVariant::All => QuantizerVariant::All,
+                QuantizerVariant::GaussianQjl => QuantizerVariant::Default,
+                other => other,
+            })?);
+            specs.extend(default_only(QuantizerKind::Naivesq, QuantizerVariant::Default)?);
             Ok(specs)
         }
     }
@@ -62,10 +66,37 @@ fn default_only(kind: QuantizerKind, variant: QuantizerVariant) -> Result<Vec<Qu
             kind,
             variant: QuantizerVariant::Default,
         }]),
-        QuantizerVariant::Fixed | QuantizerVariant::Optimal => {
+        QuantizerVariant::Fixed | QuantizerVariant::Optimal | QuantizerVariant::GaussianQjl => {
             bail!("{kind:?} does not support the {variant:?} variant")
         }
     }
+}
+
+fn turboquant_specs(variant: QuantizerVariant) -> Result<Vec<QuantizerSpec>> {
+    let specs = match variant {
+        QuantizerVariant::Default => vec![QuantizerSpec {
+            kind: QuantizerKind::Turboquant,
+            variant: QuantizerVariant::Default,
+        }],
+        QuantizerVariant::GaussianQjl => vec![QuantizerSpec {
+            kind: QuantizerKind::Turboquant,
+            variant: QuantizerVariant::GaussianQjl,
+        }],
+        QuantizerVariant::All => vec![
+            QuantizerSpec {
+                kind: QuantizerKind::Turboquant,
+                variant: QuantizerVariant::Default,
+            },
+            QuantizerSpec {
+                kind: QuantizerKind::Turboquant,
+                variant: QuantizerVariant::GaussianQjl,
+            },
+        ],
+        QuantizerVariant::Fixed | QuantizerVariant::Optimal => {
+            bail!("Turboquant does not support the {variant:?} variant")
+        }
+    };
+    Ok(specs)
 }
 
 fn rabitq_specs(variant: QuantizerVariant) -> Result<Vec<QuantizerSpec>> {
@@ -88,38 +119,42 @@ fn rabitq_specs(variant: QuantizerVariant) -> Result<Vec<QuantizerSpec>> {
                 variant: QuantizerVariant::Optimal,
             },
         ],
+        QuantizerVariant::GaussianQjl => bail!("Rabitq does not support the GaussianQjl variant"),
     };
     Ok(specs)
 }
 
-pub fn bits_for_kind(spec: QuantizerSpec, requested: &[u8]) -> Vec<u8> {
-    match spec.kind {
-        QuantizerKind::Rabitq => requested.to_vec(),
-        QuantizerKind::Turboquant | QuantizerKind::Naivesq | QuantizerKind::All => requested
-            .iter()
-            .copied()
-            .filter(|bits| *bits >= 1 && *bits <= 8)
-            .collect(),
-    }
-}
+/// Turboquant / RaBitQ / NaiveSQ experiments run at **5 bits** (optimized SIMD paths).
+pub const RECALL_QUANT_BITS: u8 = 5;
 
 pub fn build_quantizer(
     spec: QuantizerSpec,
     dims: usize,
-    bits: u8,
     seed: u64,
+    _pdx_chunk_size: usize,
 ) -> Result<Box<dyn VectorQuantizer>> {
     match spec.kind {
-        QuantizerKind::Turboquant => Ok(Box::new(TurboQuantBench::new(dims, bits, seed))),
+        QuantizerKind::Turboquant => {
+            let variant = match spec.variant {
+                QuantizerVariant::Default => TurboQuantVariant::Srht,
+                QuantizerVariant::GaussianQjl => TurboQuantVariant::GaussianQjl,
+                QuantizerVariant::Fixed | QuantizerVariant::Optimal | QuantizerVariant::All => {
+                    bail!("internal error: unresolved turboquant variant")
+                }
+            };
+            Ok(Box::new(TurboQuantBench::new(dims, seed, variant)))
+        }
         QuantizerKind::Rabitq => {
             let variant = match spec.variant {
                 QuantizerVariant::Default | QuantizerVariant::Fixed => RabitqVariant::Fixed,
                 QuantizerVariant::Optimal => RabitqVariant::Optimal,
-                QuantizerVariant::All => bail!("internal error: unresolved rabitq variant"),
+                QuantizerVariant::GaussianQjl | QuantizerVariant::All => {
+                    bail!("internal error: unresolved rabitq variant")
+                }
             };
-            Ok(Box::new(RabitqBench::new(dims, bits, seed, variant)))
+            Ok(Box::new(RabitqBench::new(dims, seed, variant)))
         }
-        QuantizerKind::Naivesq => Ok(Box::new(NaiveSqQuantizer::new(dims, bits))),
+        QuantizerKind::Naivesq => Ok(Box::new(NaiveSqQuantizer::new(dims))),
         QuantizerKind::All => bail!("internal error: build_quantizer called with all"),
     }
 }

@@ -1,28 +1,64 @@
 # Quantization Experiments
 
-This experiment measures the recall and encoding times of different quantization strategies.
-Note that "recall" is order agnostic, it simply asks the question "what percentage of the
-top K ground truth vectors are found in the top K quantized vectors?"
+The `quantization-recall` experiment compares quantized brute-force search
+against full-precision Cohere 1M ground truth. It reports recall, NDCG,
+compression, and encode time for the selected quantizers.
 
 Implemented quantizers:
 
-- `turboquant`: https://arxiv.org/abs/2504.19874
-- `rabitq`: https://arxiv.org/abs/2405.12497
+- `turboquant`: [TurboQuant](https://arxiv.org/abs/2504.19874).
+- `rabitq`: [RaBitQ](https://arxiv.org/abs/2405.12497).
 - `naivesq`: A simple scalar quantizer that learns per-dimension min/max
-  ranges from the corpus and uniformly quantizes each coordinate.
+  ranges from the corpus, uniformly quantizes each coordinate, and bit-packs
+  the resulting codes.
 
-## Results
+All three quantizers implement the shared `VectorQuantizer` trait in
+`src/quantization/mod.rs`.
 
-### 5/30/26
+## Structure
 
-| Method | Variant | Bits | Bytes / Vector | Compression | Recall@10 | NDCG@10 | Encode Time |
-|---|---|---:|---:|---:|---:|---:|---:|
-| Naive SQ | default | 5 | 480 | 6.40x | 0.9100 | 0.9398 | 1.267s |
-| TurboQuant | default | 5 | 484 | 6.35x | 0.8500 | 0.9006 | 17.138s |
-| RaBitQ | fixed | 5 | 512 | 6.00x | 0.9300 | 0.9538 | 15.872s |
-| RaBitQ | optimal | 5 | 512 | 6.00x | 0.9500 | 0.9659 | 78.150s |
+- `src/quantization/experiment.rs`: recall/compression experiment loop.
+- `src/quantization/factory.rs`: quantizer and variant selection.
+- `src/quantization/naivesq/`: naive scalar quantization baseline.
+- `src/quantization/rabitq/`: RaBitQ implementation and benchmark adapter.
+- `src/quantization/turboquant/`: TurboQuant implementation and benchmark adapter.
 
-On `rabitq`, note that it is encoded against a zero centroid to line up with Turboquant's data-obliviousness. There are two variants of `rabitq`:
+## Usage
+
+Run all quantizers at the default bit widths:
+
+```sh
+cargo run --release -- quantization-recall --quantizer all --variant default --k 10,50,100 --queries 10
+```
+
+Use `--limit` before the subcommand for quick smoke tests. Full benchmark runs
+should leave it unset:
+
+```sh
+cargo run --release -- --limit 100 quantization-recall --quantizer all --variant default --bits 1 --k 10 --queries 10
+```
+
+Run the zero-centroid RaBitQ variants:
+
+```sh
+cargo run --release -- quantization-recall --quantizer rabitq --variant all --bits 5 --k 10 --queries 10
+```
+
+Run the zero-centroid RaBitQ bit sweep:
+
+```sh
+cargo run --release -- quantization-recall --quantizer rabitq --variant all --bits 1,2,3,4,5,6,8 --k 10,50,100 --queries 10
+```
+
+Output is a table on stdout with these columns:
+
+```text
+method,variant,bits,bytes_per_vector,total_bytes,compression_x,k,recall,ndcg,encode_seconds,query_seconds,qps
+```
+
+## RaBitQ Variants
+
+`rabitq` supports two encode variants:
 
 - `fixed`: uses a precomputed scaling factor shared by all vectors. This avoids
   the expensive per-vector scale search and is the recommended default for fast
@@ -31,14 +67,19 @@ On `rabitq`, note that it is encoded against a zero centroid to line up with Tur
   can improve recall slightly, but is much slower to encode because it runs a
   per-vector optimization.
 
-Surprisingly, and contrary to the Turboquant paper, we have a variant of Rabitq which beats Turboquant on both recall and encode time.
+Both variants produce the same record size for a given bit width, so compression
+is unchanged. Query time is also expected to be similar because the packed record
+shape is the same.
 
-Also, note that "naive SQ" looks good because it is dataset aware (min/max ranges are factored into the quantization).
+## Latest 5-Bit Cohere 1M Result
 
-## Usage
+This run used 1M corpus vectors, 10 test queries, `k=10`, and normalized Cohere
+vectors. Query-time stats are omitted here because this table focuses on
+recall/compression and encode cost.
 
-Run all quantizers at the default bit widths:
-
-```sh
-cargo run --release -- quantization-recall --quantizer all --variant default --bits 4,5,6,8 --k 10,50,100 --queries 10
-```
+| Method | Variant | Bits | Bytes / Vector | Compression | Recall@10 | NDCG@10 | Encode Time |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Naive SQ | default | 5 | 480 | 6.40x | 0.9100 | 0.9398 | 1.267s |
+| TurboQuant | default | 5 | 484 | 6.35x | 0.8500 | 0.9006 | 17.138s |
+| RaBitQ | fixed | 5 | 512 | 6.00x | 0.9300 | 0.9538 | 15.872s |
+| RaBitQ | optimal | 5 | 512 | 6.00x | 0.9500 | 0.9659 | 78.150s |

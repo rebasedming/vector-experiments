@@ -24,12 +24,10 @@ pub mod bitpack;
 pub mod codebook;
 pub mod distance;
 pub mod quantizer;
-#[cfg(test)]
-pub(crate) mod recall_experiment;
 pub mod record;
 pub mod transposed;
 
 pub use codebook::Codebook;
 pub use distance::TurboQuantQuery;
-pub use quantizer::TurboQuantizer;
+pub use quantizer::{QjlProjectionKind, TurboQuantizer};
 pub use record::bytes_per_record;

@@ -14,6 +14,7 @@ pub mod quantizer;
 pub mod record;
 pub mod rotation;
 pub mod simd;
+pub mod transposed;
 
 pub use distance::RaBitQQuery;
 pub use quantizer::{QuantizedVector, RabitqConfig};

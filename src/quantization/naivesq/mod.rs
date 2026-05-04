@@ -1,6 +1,7 @@
 use anyhow::{ensure, Result};
 
 use crate::metrics::top_k_by_score;
+use crate::quantization::factory::RECALL_QUANT_BITS;
 use crate::quantization::turboquant::bitpack;
 use crate::quantization::VectorQuantizer;
 
@@ -13,9 +14,9 @@ pub struct NaiveSqQuantizer {
 }
 
 impl NaiveSqQuantizer {
-    pub fn new(dims: usize, bits: u8) -> Self {
+    pub fn new(dims: usize) -> Self {
         Self {
-            bits,
+            bits: RECALL_QUANT_BITS,
             dims,
             mins: Vec::new(),
             spans: Vec::new(),
@@ -34,7 +35,6 @@ impl VectorQuantizer for NaiveSqQuantizer {
     }
 
     fn encode(&mut self, docs: &[Vec<f32>]) -> Result<()> {
-        ensure!((1..=8).contains(&self.bits), "naivesq supports bits 1..=8");
         self.mins = vec![f32::INFINITY; self.dims];
         let mut maxs = vec![f32::NEG_INFINITY; self.dims];
         for doc in docs {
@@ -204,7 +204,7 @@ mod tests {
             })
             .collect();
         let query: Vec<f32> = (0..13).map(|dim| dim as f32 / 13.0 - 0.5).collect();
-        let mut quantizer = NaiveSqQuantizer::new(13, 5);
+        let mut quantizer = NaiveSqQuantizer::new(13);
         quantizer.encode(&docs).unwrap();
         let q = NaiveSqQuery::new(&quantizer, &query);
         for doc_idx in 0..docs.len() {

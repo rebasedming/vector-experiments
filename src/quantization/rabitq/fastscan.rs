@@ -142,7 +142,10 @@ pub fn accumulate_batch(
 
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        // The NEON path accumulates into u16 lanes. It is exact up to
+        // 128 packed bytes (= 1024 dimensions); larger vectors can overflow
+        // in worst-case LUT rows, so use the u32 scalar fallback there.
+        if dim_bytes <= 128 && std::arch::is_aarch64_feature_detected!("neon") {
             unsafe {
                 return accumulate_batch_neon(packed_codes, lut_u8, dim_bytes, results);
             }
@@ -151,7 +154,7 @@ pub fn accumulate_batch(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if dim_bytes <= 128 && is_x86_feature_detected!("avx2") {
             unsafe {
                 return accumulate_batch_avx2(packed_codes, lut_u8, dim_bytes, results);
             }

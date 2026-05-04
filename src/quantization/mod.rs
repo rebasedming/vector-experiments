@@ -6,6 +6,10 @@ pub mod rabitq;
 pub mod rotation;
 pub mod turboquant;
 
+pub use turboquant::quantizer::QjlProjectionKind;
+
+use std::borrow::Cow;
+
 use anyhow::Result;
 
 use crate::metrics::top_k_by_score;
@@ -41,10 +45,16 @@ impl From<std::io::Error> for VectorError {
 
 pub trait VectorQuantizer {
     fn name(&self) -> &'static str;
-    fn variant(&self) -> &'static str {
-        "default"
+    fn variant(&self) -> Cow<'_, str> {
+        Cow::Borrowed("default")
+    }
+    fn scoring_layout(&self) -> &'static str {
+        "doc-major"
     }
     fn bits(&self) -> u8;
+    fn set_transposed(&mut self, _enabled: bool) -> bool {
+        false
+    }
     fn encode(&mut self, docs: &[Vec<f32>]) -> Result<()>;
     fn score(&self, query: &[f32], doc_idx: usize) -> f32;
     fn top_k(&self, doc_ids: &[u64], query: &[f32], k: usize) -> Vec<(u64, f32)> {
@@ -58,6 +68,9 @@ pub trait VectorQuantizer {
         )
     }
     fn bytes_per_vector(&self) -> usize;
+    fn total_bytes(&self) -> usize {
+        0
+    }
 }
 
 pub fn compression_ratio(dims: usize, bytes_per_vector: usize) -> f32 {
