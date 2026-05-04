@@ -2,6 +2,7 @@ pub mod experiment;
 pub mod factory;
 pub mod math;
 pub mod naivesq;
+pub mod pdx_u8;
 pub mod rabitq;
 pub mod rotation;
 pub mod turboquant;

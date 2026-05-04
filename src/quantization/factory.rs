@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::ValueEnum;
 
 use crate::quantization::naivesq::NaiveSqQuantizer;
+use crate::quantization::pdx_u8::PdxU8Bench;
 use crate::quantization::rabitq::bench::{RabitqBench, RabitqVariant};
 use crate::quantization::turboquant::bench::{TurboQuantBench, TurboQuantVariant};
 use crate::quantization::VectorQuantizer;
@@ -11,6 +12,8 @@ pub enum QuantizerKind {
     Turboquant,
     Rabitq,
     Naivesq,
+    /// PDX global U8 + cluster layout + PDXearch approximate search (see `--pdx-chunk-size`).
+    Pdx,
     All,
 }
 
@@ -42,6 +45,7 @@ pub fn selected_quantizers(
         QuantizerKind::Turboquant => turboquant_specs(variant),
         QuantizerKind::Rabitq => rabitq_specs(variant),
         QuantizerKind::Naivesq => default_only(kind, variant),
+        QuantizerKind::Pdx => pdx_specs(variant),
         QuantizerKind::All => {
             let mut specs = Vec::new();
             specs.extend(turboquant_specs(match variant {
@@ -55,7 +59,20 @@ pub fn selected_quantizers(
                 other => other,
             })?);
             specs.extend(default_only(QuantizerKind::Naivesq, QuantizerVariant::Default)?);
+            specs.extend(pdx_specs(QuantizerVariant::Default)?);
             Ok(specs)
+        }
+    }
+}
+
+fn pdx_specs(variant: QuantizerVariant) -> Result<Vec<QuantizerSpec>> {
+    match variant {
+        QuantizerVariant::Default | QuantizerVariant::All => Ok(vec![QuantizerSpec {
+            kind: QuantizerKind::Pdx,
+            variant: QuantizerVariant::Default,
+        }]),
+        QuantizerVariant::Fixed | QuantizerVariant::Optimal | QuantizerVariant::GaussianQjl => {
+            bail!("pdx supports only --variant default")
         }
     }
 }
@@ -131,7 +148,7 @@ pub fn build_quantizer(
     spec: QuantizerSpec,
     dims: usize,
     seed: u64,
-    _pdx_chunk_size: usize,
+    pdx_chunk_size: usize,
 ) -> Result<Box<dyn VectorQuantizer>> {
     match spec.kind {
         QuantizerKind::Turboquant => {
@@ -155,6 +172,11 @@ pub fn build_quantizer(
             Ok(Box::new(RabitqBench::new(dims, seed, variant)))
         }
         QuantizerKind::Naivesq => Ok(Box::new(NaiveSqQuantizer::new(dims))),
+        QuantizerKind::Pdx => Ok(Box::new(PdxU8Bench::new(
+            dims,
+            pdx_chunk_size.max(1),
+            seed,
+        ))),
         QuantizerKind::All => bail!("internal error: build_quantizer called with all"),
     }
 }
