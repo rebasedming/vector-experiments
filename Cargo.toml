@@ -17,3 +17,7 @@ serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = "0.3"
+
+[[example]]
+name = "sgemm_bench"
+path = "examples/sgemm_bench.rs"
