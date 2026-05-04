@@ -1,19 +1,18 @@
 # vector-experiments
 
-Standalone Rust experiments over the VectorDBBench Cohere 1M dataset.
+Standalone Rust experiments over **VectorDBBench** embedding benchmarks shipped with this repo’s CLI.
 
-The repo is structured around a generic experiment runner. Each experiment owns
-its CLI arguments, work loop, measurements, and output format.
+The harness loads one or more datasets (your choice), runs the selected experiment on each corpus in turn, and prints a Markdown section header (`## <dataset>`) plus tables on stdout.
+
+Each experiment owns its CLI arguments, work loop, measurements, and output format.
 
 ## Experiments
 
-Experiments live as folders/modules under `src/`. The generic harness in
-`src/main.rs` loads the Cohere dataset once, selects the requested experiment
-from the CLI, and then delegates the actual work to that experiment.
+Experiment modules live under `src/`. `src/main.rs` parses shared dataset flags, loads embeddings and ground-truth neighbors, then delegates to the experiment implementation.
 
 To add a new experiment:
 
-1. Create a new module folder under `src/`, for example `src/my_experiment/`.
+1. Create a module folder under `src/`, for example `src/my_experiment/`.
 2. Define a clap args struct for the experiment, usually with `#[derive(Debug, Args)]`.
 3. Implement the `Experiment` trait from `src/experiment.rs`:
 
@@ -32,15 +31,19 @@ Experiment-specific implementation details and CLI flags should stay inside the
 experiment module. The top-level CLI should remain limited to dataset loading
 and experiment selection.
 
-## Dataset
+Current experiment docs:
 
-By default the harness looks for Cohere 1M at:
+- [`src/quantization/README.md`](src/quantization/README.md): quantization recall/compression benchmarks.
+
+## Datasets
+
+Built-in presets mirror **VectorDBBench “medium”** corpora (see `DatasetSpec` in `src/dataset.rs`). Paths are rooted at **`--dataset-root`**, which defaults to:
 
 ```text
-/tmp/vectordb_bench/dataset/cohere/cohere_medium_1m
+/tmp/vectordb_bench/dataset
 ```
 
-Expected files:
+Each corpus lives under `<dataset_root>/<source>/<corpus_dir>/` with the same three parquet files:
 
 ```text
 shuffle_train.parquet
@@ -48,17 +51,29 @@ test.parquet
 neighbors.parquet
 ```
 
-The loader uses Cohere's fixed 768 dimensions and normalizes vectors for
-inner-product/cosine evaluation.
+| CLI `--dataset` value | Corpus directory | Rough scale | Embedding dims | Notes |
+|----------------------|------------------|-------------|----------------|-------|
+| `cohere-medium` | `cohere/cohere_medium_1m` | ~1M docs | 768 | Wikipedia text, **Cohere V2** embeddings. |
+| `openai-medium` | `openai/openai_medium_500k` | ~500K docs | 1536 | C4 web crawl, **OpenAI** embeddings. |
+| `bioasq-medium` | `bioasq/bioasq_medium_1m` | ~1M docs | 1024 | BioASQ biomedical text, **Cohere V3** embeddings. |
 
-If the files are missing, pass `--fetch` to download them from VectorDBBench's
-public asset path.
+Use **`--dataset all`** (default) to run the experiment sequentially on **all three** presets above.
 
-You can also point at an existing directory:
+The loader normalizes corpus and query vectors so inner-product scoring matches cosine-like retrieval used for these benchmarks.
+
+If parquet files are missing, downloads are attempted automatically from VectorDBBench’s public asset URLs (unless you pass **`--no-fetch`**).
+
+Example:
 
 ```sh
-cargo run --release -- --dataset-dir /path/to/cohere_medium_1m <experiment>
+# Single corpus under the default root
+cargo run --release -- --dataset cohere-medium quantization-recall --quantizer turboquant
+
+# Custom root; smoke-test with a doc cap
+cargo run --release -- --dataset-root /data/vectordb_bench/dataset --dataset openai-medium --limit 10000 quantization-recall
+
+# Run every built-in dataset (default --dataset all)
+cargo run --release -- quantization-recall --quantizer all
 ```
 
-Status/progress messages are printed to stderr. Experiment results are printed
-to stdout.
+Status and progress messages go to stderr; experiment tables go to stdout.
