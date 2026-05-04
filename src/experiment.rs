@@ -79,12 +79,9 @@ pub enum ExperimentKind {
 }
 
 impl ExperimentKind {
-    pub fn into_experiment(self, dims: usize) -> Box<dyn Experiment> {
+    pub fn into_experiment(self) -> Box<dyn Experiment> {
         match self {
-            ExperimentKind::QuantizationRecall(mut experiment) => {
-                experiment.set_dims(dims);
-                Box::new(experiment)
-            }
+            ExperimentKind::QuantizationRecall(experiment) => Box::new(experiment),
         }
     }
 }
