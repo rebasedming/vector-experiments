@@ -1,7 +1,11 @@
 #![allow(dead_code, unused_imports)]
 
+#[cfg(target_os = "macos")]
+extern crate accelerate_src;
+
 mod dataset;
 mod experiment;
+mod kmeans;
 mod metrics;
 mod quantization;
 

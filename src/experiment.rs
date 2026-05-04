@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use crate::dataset::Dataset;
+use crate::kmeans::experiment::KMeansExperiment;
 use crate::quantization::experiment::QuantizationRecallExperiment;
 
 pub trait Experiment {
@@ -12,6 +13,9 @@ pub trait Experiment {
 pub struct ExperimentOutput {
     header: Vec<String>,
     rows: Vec<Vec<String>>,
+    /// Extra pre-formatted sections appended after the main table (e.g. a
+    /// recall sub-table with a different column structure).
+    extras: Vec<String>,
 }
 
 impl ExperimentOutput {
@@ -19,11 +23,16 @@ impl ExperimentOutput {
         Self {
             header: header.into_iter().map(Into::into).collect(),
             rows: Vec::new(),
+            extras: Vec::new(),
         }
     }
 
     pub fn push_row(&mut self, row: impl IntoIterator<Item = impl Into<String>>) {
         self.rows.push(row.into_iter().map(Into::into).collect());
+    }
+
+    pub fn push_extra(&mut self, section: impl Into<String>) {
+        self.extras.push(section.into());
     }
 
     pub fn print_csv(&self) {
@@ -49,6 +58,10 @@ impl ExperimentOutput {
         print_separator(&widths);
         for row in &self.rows {
             print_row(row, &widths, &numeric);
+        }
+        for extra in &self.extras {
+            println!();
+            print!("{extra}");
         }
     }
 }
@@ -76,12 +89,16 @@ fn print_separator(widths: &[usize]) {
 #[derive(Debug, Subcommand)]
 pub enum ExperimentKind {
     QuantizationRecall(QuantizationRecallExperiment),
+    /// Train SuperKMeans on each dataset's corpus and report per-iteration stats.
+    #[command(name = "kmeans")]
+    KMeans(KMeansExperiment),
 }
 
 impl ExperimentKind {
     pub fn into_experiment(self) -> Box<dyn Experiment> {
         match self {
             ExperimentKind::QuantizationRecall(experiment) => Box::new(experiment),
+            ExperimentKind::KMeans(experiment) => Box::new(experiment),
         }
     }
 }
