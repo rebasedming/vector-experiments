@@ -2,9 +2,7 @@
 
 #[cfg(target_os = "macos")]
 extern crate accelerate_src;
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-extern crate openblas_src;
+// Linux/aarch64: BLIS is linked via build.rs.
 
 mod dataset;
 mod experiment;

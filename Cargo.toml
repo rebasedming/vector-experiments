@@ -19,10 +19,14 @@ serde = { version = "1", features = ["derive"] }
 accelerate-src = "0.3"
 
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
-# Link against the system OpenBLAS (apt: libopenblas-dev). On Graviton4 /
-# Neoverse-V2 this gets us SVE2 sgemm kernels, vs ~13× slower NEON-only
-# matrixmultiply.
-openblas-src = { version = "0.10", default-features = false, features = ["system", "cblas"] }
+# BLIS is linked via build.rs (`cargo:rustc-link-lib=blis-pthread`).
+# We use BLIS over OpenBLAS on Linux/aarch64 because BLIS scales much
+# better across Neoverse-V2 cores: at 4 threads we measure ~218 GFLOPS
+# vs OpenBLAS's ~155 (OpenBLAS auto-picks neoversev1 kernels and tops
+# out at 1.8× single-core scaling on Graviton4). Single-thread the
+# numbers are reversed (OpenBLAS 86 GFLOPS, BLIS 66) but our workloads
+# are always multi-threaded.
+# Required system package: libblis-pthread-dev
 
 [[example]]
 name = "sgemm_bench"

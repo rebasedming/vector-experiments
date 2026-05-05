@@ -6,9 +6,7 @@ use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 extern crate accelerate_src;
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-extern crate openblas_src;
+// Linux/aarch64: BLIS is linked via build.rs.
 
 #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
 mod cblas {
@@ -90,7 +88,7 @@ fn main() {
     let backend = if cfg!(target_os = "macos") {
         "Apple Accelerate (auto-AMX)"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "OpenBLAS (system, SVE2 kernels)"
+        "BLIS (system, SVE2 kernels)"
     } else {
         "matrixmultiply (pure-Rust NEON/AVX)"
     };
