@@ -84,7 +84,20 @@ fn run(label: &str, n: usize, k: usize, d: usize) {
     println!("best:     {best_ms:>7.0} ms  ({best_gflops:>6.1} GFLOPS)");
 }
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+extern "C" { fn bli_thread_set_num_threads(n: i64); }
+
+fn init_blas() {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        let n = std::thread::available_parallelism()
+            .map(|x| x.get() as i64).unwrap_or(1);
+        unsafe { bli_thread_set_num_threads(n) };
+    }
+}
+
 fn main() {
+    init_blas();
     let backend = if cfg!(target_os = "macos") {
         "Apple Accelerate (auto-AMX)"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {

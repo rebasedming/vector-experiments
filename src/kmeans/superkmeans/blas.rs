@@ -34,6 +34,31 @@ mod cblas {
     }
 }
 
+/// On Linux/aarch64 (BLIS), force multi-threaded execution. BLIS defaults to
+/// single-threaded even when the pthread variant is linked, so without this
+/// we'd run sgemm at ~66 GFLOPS instead of ~218 GFLOPS on Graviton4.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod blis_threads {
+    extern "C" {
+        fn bli_thread_set_num_threads(n: i64);
+    }
+
+    pub fn init() {
+        let n = std::thread::available_parallelism()
+            .map(|x| x.get() as i64)
+            .unwrap_or(1);
+        unsafe { bli_thread_set_num_threads(n) };
+    }
+}
+
+/// Configure the underlying BLAS library. Currently only meaningful on
+/// Linux/aarch64 where it sets BLIS thread count to `available_parallelism`.
+/// Apple Accelerate auto-tunes; matrixmultiply is single-call.
+pub fn init() {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    blis_threads::init();
+}
+
 #[derive(Clone, Copy)]
 pub enum Trans {
     No,
