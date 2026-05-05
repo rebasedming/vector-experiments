@@ -43,7 +43,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    kmeans::superkmeans::blas::init();
+    kmeans::distance::blas_init();
     let args = Args::parse();
     let dataset_root = args.dataset_root.unwrap_or_else(default_dataset_root);
     let experiment = args.experiment.into_experiment();

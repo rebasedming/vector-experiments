@@ -89,7 +89,6 @@ fn print_separator(widths: &[usize]) {
 #[derive(Debug, Subcommand)]
 pub enum ExperimentKind {
     QuantizationRecall(QuantizationRecallExperiment),
-    /// Train SuperKMeans on each dataset's corpus and report per-iteration stats.
     #[command(name = "kmeans")]
     KMeans(KMeansExperiment),
 }

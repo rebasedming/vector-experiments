@@ -1,20 +1,10 @@
-//! Lifted from `tantivy/src/vector/cluster/kmeans.rs` (turboquant branch).
-//!
-//! FAISS-style sampled Lloyd's k-means with farthest-point empty-cluster
-//! reseeding. Algorithmically identical to the upstream — only the BLAS
-//! dispatch is plumbed through our `superkmeans::blas` so it picks up
-//! Apple Accelerate or BLIS instead of `matrixmultiply` directly.
-//!
-//! Reference: <https://github.com/quickwit-oss/tantivy>
-
 use std::cmp::Ordering;
 
+use matrixmultiply::sgemm;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rand::RngCore;
 use rayon::prelude::*;
-
-use crate::kmeans::superkmeans::blas::{sgemm_row_major, Trans};
 
 const RESEED_CANDIDATES: usize = 8;
 const DEFAULT_MAX_POINTS_PER_CENTROID: usize = 256;
@@ -428,23 +418,24 @@ fn assign_points_for_update(
 
                 state.buffer.resize_for_chunk(len, k);
 
-                // dot_products[len, k] = data_chunk[len, dim] @ centroid_col[dim, k]
-                // (centroid_col is pre-transposed, both inputs row-major.)
-                sgemm_row_major(
-                    Trans::No,
-                    Trans::No,
-                    len,
-                    k,
-                    dim,
-                    1.0,
-                    data_chunk,
-                    dim,
-                    centroid_col,
-                    k,
-                    0.0,
-                    &mut state.buffer.dot_products,
-                    k,
-                );
+                unsafe {
+                    sgemm(
+                        len,
+                        dim,
+                        k,
+                        1.0,
+                        data_chunk.as_ptr(),
+                        dim as isize,
+                        1,
+                        centroid_col.as_ptr(),
+                        k as isize,
+                        1,
+                        0.0,
+                        state.buffer.dot_products.as_mut_ptr(),
+                        k as isize,
+                        1,
+                    );
+                }
 
                 let mut chunk_assignments = Vec::with_capacity(len);
                 let mut chunk_candidates: Vec<(f32, usize)> = Vec::new();
@@ -611,21 +602,24 @@ fn compute_chunk_assignments_only(
     centroid_norms: &[f32],
 ) -> Vec<usize> {
     let mut dot_products = vec![0.0f32; len * k];
-    sgemm_row_major(
-        Trans::No,
-        Trans::No,
-        len,
-        k,
-        dim,
-        1.0,
-        data_chunk,
-        dim,
-        centroid_col,
-        k,
-        0.0,
-        &mut dot_products,
-        k,
-    );
+    unsafe {
+        sgemm(
+            len,
+            dim,
+            k,
+            1.0,
+            data_chunk.as_ptr(),
+            dim as isize,
+            1,
+            centroid_col.as_ptr(),
+            k as isize,
+            1,
+            0.0,
+            dot_products.as_mut_ptr(),
+            k as isize,
+            1,
+        );
+    }
 
     let mut assignments = Vec::with_capacity(len);
     for row in 0..len {

@@ -6,35 +6,21 @@ use clap::Args;
 
 use crate::dataset::Dataset;
 use crate::experiment::{Experiment, ExperimentOutput};
+use crate::kmeans::distance::{find_k_nearest_neighbors, X_BATCH_SIZE, Y_BATCH_SIZE};
 use crate::kmeans::spann::{
-    balance_from_sizes, duplicate_assignments, duplicated_cluster_sizes,
-    hierarchical_balanced_kmeans,
+    duplicate_assignments, duplicate_assignments_via_tree, duplicated_cluster_sizes,
+    hierarchical_balanced_kmeans, BisectTree,
 };
-use crate::kmeans::superkmeans::batch::find_k_nearest_neighbors;
-use crate::kmeans::superkmeans::common::{X_BATCH_SIZE, Y_BATCH_SIZE};
-use crate::kmeans::superkmeans::{SuperKMeans, SuperKMeansConfig};
-use crate::kmeans::tantivy;
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-pub enum Variant {
-    /// Faithful 1:1 port of `cwida/SuperKMeans` (PDX layout + ADSampling
-    /// pruning gated behind `--superkmeans`; vanilla Lloyd's otherwise).
-    Superkmeans,
-    /// Lifted from `tantivy/src/vector/cluster/kmeans.rs` (turboquant
-    /// branch). FAISS-style sampled Lloyd's with farthest-point empty-
-    /// cluster reseeding and best-of-N restarts.
-    Tantivy,
-}
+use crate::kmeans::vanilla;
 
 #[derive(Debug, Clone, Args)]
 pub struct KMeansExperiment {
-    /// Which k-means implementation to run.
-    #[arg(long, value_enum, default_value_t = Variant::Superkmeans)]
-    pub variant: Variant,
-
-    /// Number of clusters to train.
-    #[arg(long, default_value_t = 1024)]
-    pub k: usize,
+    /// Centroids as a fraction of corpus size. The cluster count `k` is
+    /// computed at run time as `round(n * centroid_ratio)` for each dataset.
+    /// Comma-separated to sweep multiple ratios in one run; SPANN reports
+    /// saturation around 0.16 (16% of n).
+    #[arg(long, value_delimiter = ',', default_values_t = vec![0.001f32])]
+    pub centroid_ratio: Vec<f32>,
 
     /// Maximum k-means iterations (Lloyd's path only; ignored if --hierarchical).
     #[arg(long, default_value_t = 10)]
@@ -47,15 +33,6 @@ pub struct KMeansExperiment {
     /// Maximum points per cluster (FAISS-style sampling cap).
     #[arg(long, default_value_t = 256)]
     pub max_points_per_cluster: u32,
-
-    /// Enable all SuperKMeans optimisations on top of vanilla Lloyd's:
-    /// random orthogonal rotation, ADSampling-based dimension pruning over a
-    /// PDX block layout, and early termination on centroid-shift / cost /
-    /// recall tolerance. Off by default — without this flag the experiment
-    /// runs plain GEMM-based Lloyd's iteration with no pruning, no rotation,
-    /// and a fixed `--iters` count.
-    #[arg(long, default_value_t = false)]
-    pub superkmeans: bool,
 
     /// Random seed.
     #[arg(long, default_value_t = 42)]
@@ -109,7 +86,7 @@ pub struct KMeansExperiment {
 
 impl Experiment for KMeansExperiment {
     fn name(&self) -> &'static str {
-        "kmeans/superkmeans"
+        "kmeans"
     }
 
     fn run(&self, data: &Dataset) -> Result<ExperimentOutput> {
@@ -120,269 +97,269 @@ impl Experiment for KMeansExperiment {
             flat.extend_from_slice(v);
         }
 
-        let mut output = ExperimentOutput::new([
-            "stage", "objective", "shift", "split", "not_pruned_pct", "partial_d", "gemm_only", "ms",
+        let mut header: Vec<String> = vec![
+            "variant".to_string(),
+            "ratio".to_string(),
+            "k".to_string(),
+            "total_ms".to_string(),
+            "fanout".to_string(),
+        ];
+        for k_val in &self.recall_k {
+            header.push(format!("r@{}", k_val));
+        }
+        header.extend([
+            "min_size".to_string(),
+            "median_size".to_string(),
+            "max_size".to_string(),
+            "memory".to_string(),
+            "disk".to_string(),
         ]);
+        let mut output = ExperimentOutput::new(header);
 
-        // -------- 1. Train: produce centroids + primary assignments --------
-        let mut setup_ms = 0.0f64;
-        let mut train_ms = 0.0f64;
-        let mut assign_ms = 0.0f64;
-        let (centroids, primary_assignments): (Vec<f32>, Vec<u32>) = if self.hierarchical {
-            let t = Instant::now();
-            let (c, a) = hierarchical_balanced_kmeans(
-                &flat,
-                n,
-                dims,
-                self.k,
-                self.hierarchical_iters_per_bisect,
-                self.seed,
-            );
-            train_ms = t.elapsed().as_secs_f64() * 1000.0;
-            output.push_row([
-                "HIERARCH".to_string(),
-                format!("levels={}", (self.k as f32).log2().ceil() as u32),
-                format!("iters/bisect={}", self.hierarchical_iters_per_bisect),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ]);
-            (c, a)
-        } else {
-            match self.variant {
-                Variant::Superkmeans => self.run_superkmeans(
-                    &flat,
-                    n,
-                    dims,
-                    &mut output,
-                    &mut setup_ms,
-                    &mut train_ms,
-                    &mut assign_ms,
-                ),
-                Variant::Tantivy => self.run_tantivy(
-                    &data.docs,
-                    n,
-                    dims,
-                    &mut output,
-                    &mut train_ms,
-                ),
-            }
-        };
-
-        // -------- 2. Primary balance summary --------
-        let primary_balance = SuperKMeans::cluster_balance_stats(&primary_assignments, n, self.k);
-        if setup_ms > 0.0 {
-            output.push_row([
-                "SETUP".to_string(),
-                "pruner+buffers".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                format!("{:.1}", setup_ms),
-            ]);
-        }
-        output.push_row([
-            "TRAIN".to_string(),
-            format!("n={}", n),
-            format!("min={}", primary_balance.min),
-            format!("max={}", primary_balance.max),
-            format!("mean={:.1}", primary_balance.mean),
-            format!("CV={:.3}", primary_balance.cv),
-            String::new(),
-            format!("{:.1}", train_ms),
-        ]);
-        if assign_ms > 0.0 {
-            let method = if self.superkmeans { "pruned" } else { "brute" };
-            output.push_row([
-                "ASSIGN".to_string(),
-                format!("{}, k={}", method, self.k),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                format!("{:.1}", assign_ms),
-            ]);
+        for &ratio in &self.centroid_ratio {
+            let k = ((n as f32 * ratio).round() as usize).clamp(1, n);
+            self.run_one_ratio(data, &flat, n, dims, ratio, k, &mut output);
         }
 
-        // -------- 3. Boundary duplication (optional) --------
-        let dup_enabled = self.duplicate_max > 1 && self.duplicate_ratio > 1.0;
-        let dup_start = Instant::now();
-        let multi_assignments = if dup_enabled {
-            duplicate_assignments(
-                &flat,
-                n,
-                dims,
-                &centroids,
-                self.k,
-                &primary_assignments,
-                self.duplicate_max,
-                self.duplicate_ratio,
-            )
-        } else {
-            primary_assignments.iter().map(|&c| vec![c]).collect()
-        };
-        let dup_ms = dup_start.elapsed().as_secs_f64() * 1000.0;
-        if dup_enabled {
-            let total: usize = multi_assignments.iter().map(|v| v.len()).sum();
-            let avg_copies = total as f32 / n as f32;
-            let dup_sizes = duplicated_cluster_sizes(&multi_assignments, self.k);
-            let (mean, _, min, max, cv) = balance_from_sizes(&dup_sizes);
-            output.push_row([
-                "DUPLICATE".to_string(),
-                format!("avg_copies={:.2}", avg_copies),
-                format!("min={}", min),
-                format!("max={}", max),
-                format!("mean={:.1}", mean),
-                format!("CV={:.3}", cv),
-                String::new(),
-                format!("{:.1}", dup_ms),
-            ]);
-        }
-
-        // -------- 4. Recall --------
-        let recall_section = compute_recall_section(
-            data,
-            dims,
-            self.k,
-            &centroids,
-            &multi_assignments,
-            &self.recall_k,
-            &self.recall_n,
-        );
-        if let Some((section, recall_ms)) = recall_section {
-            output.push_row([
-                "RECALL".to_string(),
-                format!("queries={}", data.queries.len()),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                format!("{:.1}", recall_ms),
-            ]);
-            output.push_extra(section);
-        }
-
-        let total_ms = setup_ms + train_ms + assign_ms + dup_ms;
-        output.push_row([
-            "TOTAL".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            format!("{:.1}", total_ms),
-        ]);
         Ok(output)
     }
 }
 
 impl KMeansExperiment {
-    fn run_superkmeans(
+    #[allow(clippy::too_many_arguments)]
+    fn run_one_ratio(
         &self,
+        data: &Dataset,
         flat: &[f32],
         n: usize,
         dims: usize,
+        ratio: f32,
+        k: usize,
         output: &mut ExperimentOutput,
-        setup_ms: &mut f64,
-        train_ms: &mut f64,
-        assign_ms: &mut f64,
-    ) -> (Vec<f32>, Vec<u32>) {
-        let cfg = SuperKMeansConfig {
-            iters: self.iters,
-            sampling_fraction: self.sampling_fraction,
-            max_points_per_cluster: self.max_points_per_cluster,
-            seed: self.seed,
-            use_blas_only: !self.superkmeans,
-            early_termination: self.superkmeans,
-            data_already_rotated: !self.superkmeans,
-            verbose: self.verbose,
-            ..SuperKMeansConfig::default()
+    ) {
+        // -------- 1. Train: produce centroids + primary assignments --------
+        let mut train_ms = 0.0f64;
+        let mut bisect_tree: Option<BisectTree> = None;
+        let (variant_label, centroids, primary_assignments): (&str, Vec<f32>, Vec<u32>) =
+            if self.hierarchical {
+                let t = Instant::now();
+                let (c, a, tree) = hierarchical_balanced_kmeans(
+                    flat,
+                    n,
+                    dims,
+                    k,
+                    self.hierarchical_iters_per_bisect,
+                    self.seed,
+                );
+                train_ms = t.elapsed().as_secs_f64() * 1000.0;
+                bisect_tree = Some(tree);
+                ("hierarchical", c, a)
+            } else {
+                let (c, a) =
+                    self.run_vanilla(&data.docs, n, dims, k, &mut train_ms);
+                ("vanilla", c, a)
+            };
+
+        eprintln!(
+            "  [ratio={:.3} k={}] train={:.1}s",
+            ratio,
+            k,
+            train_ms / 1000.0,
+        );
+
+        // -------- 2. Boundary duplication (optional) --------
+        let dup_enabled = self.duplicate_max > 1 && self.duplicate_ratio > 1.0;
+        let dup_t = Instant::now();
+        let multi_assignments: Vec<Vec<u32>> = if dup_enabled {
+            if let Some(tree) = &bisect_tree {
+                duplicate_assignments_via_tree(
+                    flat,
+                    n,
+                    dims,
+                    &centroids,
+                    k,
+                    &primary_assignments,
+                    self.duplicate_max,
+                    self.duplicate_ratio,
+                    tree,
+                    4, // budget = max_copies × 4 leaves visited per query
+                )
+            } else {
+                duplicate_assignments(
+                    flat,
+                    n,
+                    dims,
+                    &centroids,
+                    k,
+                    &primary_assignments,
+                    self.duplicate_max,
+                    self.duplicate_ratio,
+                )
+            }
+        } else {
+            primary_assignments.iter().map(|&c| vec![c]).collect()
         };
-        let t_setup = Instant::now();
-        let mut km = SuperKMeans::new(self.k, dims, cfg);
-        *setup_ms = t_setup.elapsed().as_secs_f64() * 1000.0;
-
-        let t_train = Instant::now();
-        let centroids = km.train(flat, n, None, 0);
-        *train_ms = t_train.elapsed().as_secs_f64() * 1000.0;
-
-        for stat in &km.iteration_stats {
-            output.push_row([
-                stat.iteration.to_string(),
-                format!("{:.4}", stat.objective),
-                format!("{:.6}", stat.shift),
-                stat.split.to_string(),
-                format!("{:.4}", stat.not_pruned_pct),
-                stat.partial_d.to_string(),
-                stat.is_gemm_only.to_string(),
-                format!("{:.1}", stat.duration_ms),
-            ]);
+        let dup_ms = dup_t.elapsed().as_secs_f64() * 1000.0;
+        if dup_enabled {
+            eprintln!("  [ratio={:.3} k={}] duplicate={:.1}s", ratio, k, dup_ms / 1000.0);
         }
 
-        // With --superkmeans we use the pruning fast-path
-        // (assign_training_points), which on non-AMX hardware can be
-        // dramatically faster than brute-force; without the flag we fall
-        // back to brute-force `assign` (the pruning ratios assume the
-        // rotation has been applied, so they're not valid otherwise).
-        let t_assign = Instant::now();
-        let primary = if self.superkmeans {
-            km.assign_training_points(flat, &centroids, n, self.k)
+        // -------- 3. Cluster size distribution + storage --------
+        let cluster_sizes: Vec<u32> = if dup_enabled {
+            duplicated_cluster_sizes(&multi_assignments, k)
         } else {
-            km.assign(flat, &centroids, n, self.k)
+            let mut sizes = vec![0u32; k];
+            for &c in &primary_assignments {
+                sizes[c as usize] += 1;
+            }
+            sizes
         };
-        *assign_ms = t_assign.elapsed().as_secs_f64() * 1000.0;
-        (centroids, primary)
-    }
+        let (size_min, size_median, size_max) = min_median_max(&cluster_sizes);
 
-    fn run_tantivy(
+        let bytes_per_vec = dims * 4;
+        let total_doc_copies: u64 = cluster_sizes.iter().map(|&s| s as u64).sum();
+        let centroid_bytes = (k as u64) * bytes_per_vec as u64;
+        let posting_bytes = total_doc_copies * bytes_per_vec as u64;
+        let mem_str = format_bytes(centroid_bytes);
+        let disk_str = format_bytes(posting_bytes);
+
+        // -------- 4. Recall --------
+        let recall_t = Instant::now();
+        let recall = compute_recall(
+            data,
+            dims,
+            k,
+            &centroids,
+            &multi_assignments,
+            &self.recall_k,
+            &self.recall_n,
+        );
+        let recall_ms = recall_t.elapsed().as_secs_f64() * 1000.0;
+        if recall.is_some() {
+            eprintln!("  [ratio={:.3} k={}] recall={:.1}s", ratio, k, recall_ms / 1000.0);
+        }
+
+        // -------- 5. Emit rows --------
+        let total_str = format!("{:.1}", train_ms);
+        let ratio_str = format!("{:.3}", ratio);
+        let k_str = k.to_string();
+
+        if let Some(recall) = &recall {
+            for (n_idx, n_frac) in self.recall_n.iter().enumerate() {
+                let n_count = recall.n_counts[n_idx];
+                let mut row = vec![
+                    variant_label.to_string(),
+                    ratio_str.clone(),
+                    k_str.clone(),
+                    total_str.clone(),
+                    format!("{:.2}% (n={})", n_frac * 100.0, n_count),
+                ];
+                for k_idx in 0..self.recall_k.len() {
+                    row.push(format!("{:.4}", recall.values[k_idx][n_idx]));
+                }
+                row.extend([
+                    size_min.to_string(),
+                    format!("{:.1}", size_median),
+                    size_max.to_string(),
+                    mem_str.clone(),
+                    disk_str.clone(),
+                ]);
+                output.push_row(row);
+            }
+        } else {
+            let mut row = vec![
+                variant_label.to_string(),
+                ratio_str,
+                k_str,
+                total_str,
+                "-".to_string(),
+            ];
+            for _ in &self.recall_k {
+                row.push("-".to_string());
+            }
+            row.extend([
+                size_min.to_string(),
+                format!("{:.1}", size_median),
+                size_max.to_string(),
+                mem_str,
+                disk_str,
+            ]);
+            output.push_row(row);
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn min_median_max(sizes: &[u32]) -> (u32, f32, u32) {
+    if sizes.is_empty() {
+        return (0, 0.0, 0);
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let min = *sorted.first().unwrap();
+    let max = *sorted.last().unwrap();
+    let mid = sorted.len() / 2;
+    let median = if sorted.len() % 2 == 1 {
+        sorted[mid] as f32
+    } else {
+        (sorted[mid - 1] as f32 + sorted[mid] as f32) / 2.0
+    };
+    (min, median, max)
+}
+
+struct RecallResult {
+    n_counts: Vec<usize>,
+    /// values[k_idx][n_idx]
+    values: Vec<Vec<f32>>,
+}
+
+impl KMeansExperiment {
+    fn run_vanilla(
         &self,
         docs: &[Vec<f32>],
         n: usize,
         dims: usize,
-        output: &mut ExperimentOutput,
+        k: usize,
         train_ms: &mut f64,
     ) -> (Vec<f32>, Vec<u32>) {
-        let cfg = tantivy::KMeansConfig {
+        // dot_products buffer is sized chunk × k × 4 bytes per rayon thread.
+        // Cap it at ~64 MB per thread to keep total memory bounded as k grows.
+        let target_bytes_per_thread: usize = 64 * 1024 * 1024;
+        let decode_block_size =
+            (target_bytes_per_thread / (k.max(1) * 4)).clamp(64, 32_768);
+
+        let cfg = vanilla::KMeansConfig {
             niter: self.iters as usize,
             nredo: self.nredo,
             seed: self.seed,
             spherical: self.spherical,
             max_points_per_centroid: self.max_points_per_cluster as usize,
-            decode_block_size: 32_768,
+            decode_block_size,
         };
         let t = Instant::now();
-        let result = tantivy::run_kmeans_with_config(docs, self.k, cfg);
+        let result = vanilla::run_kmeans_with_config(docs, k, cfg);
         *train_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let mut centroids = Vec::with_capacity(self.k * dims);
+        let mut centroids = Vec::with_capacity(k * dims);
         for c in &result.centroids {
             centroids.extend_from_slice(c);
         }
         let assignments: Vec<u32> = result.assignments.iter().map(|&a| a as u32).collect();
         debug_assert_eq!(assignments.len(), n);
-
-        let avg_iter_ms = if self.iters > 0 {
-            *train_ms / self.iters as f64
-        } else {
-            0.0
-        };
-        output.push_row([
-            "TANTIVY".to_string(),
-            format!("{:.4}", result.objective),
-            format!("nredo={}", self.nredo),
-            format!("iters={}", self.iters),
-            String::new(),
-            String::new(),
-            format!("avg_iter={:.0}ms", avg_iter_ms),
-            format!("{:.1}", *train_ms),
-        ]);
         (centroids, assignments)
     }
 }
@@ -390,7 +367,7 @@ impl KMeansExperiment {
 /// For each query, find the closest `max_n` centroids; then for each (k, n)
 /// pair report the fraction of GT-top-k corpus neighbours whose **multi-cluster
 /// assignment** intersects the query's top-n centroid set.
-fn compute_recall_section(
+fn compute_recall(
     data: &Dataset,
     dims: usize,
     n_clusters: usize,
@@ -398,7 +375,7 @@ fn compute_recall_section(
     assignments: &[Vec<u32>],
     recall_k: &[usize],
     recall_n_fracs: &[f32],
-) -> Option<(String, f64)> {
+) -> Option<RecallResult> {
     let n_queries = data.queries.len();
     if n_queries == 0 || data.ground_truth.is_empty() {
         return None;
@@ -414,8 +391,6 @@ fn compute_recall_section(
     if max_n == 0 {
         return None;
     }
-
-    let recall_start = Instant::now();
 
     let mut q_flat = Vec::with_capacity(n_queries * dims);
     for v in &data.queries {
@@ -492,67 +467,8 @@ fn compute_recall_section(
         }
     }
 
-    let recall_ms = recall_start.elapsed().as_secs_f64() * 1000.0;
-
-    let header: Vec<String> = std::iter::once("recall".to_string())
-        .chain(
-            recall_n_fracs
-                .iter()
-                .zip(recall_n_counts.iter())
-                .map(|(frac, count)| format!("{:.2}% (n={})", frac * 100.0, count)),
-        )
-        .collect();
-    let rows: Vec<Vec<String>> = recall_k
-        .iter()
-        .enumerate()
-        .map(|(k_idx, k_val)| {
-            let mut row = vec![format!("top-{k_val}")];
-            for n_idx in 0..recall_n_counts.len() {
-                row.push(format!("{:.4}", recall[k_idx][n_idx]));
-            }
-            row
-        })
-        .collect();
-    let section = render_markdown_table(&header, &rows);
-    Some((section, recall_ms))
-}
-
-fn render_markdown_table(header: &[String], rows: &[Vec<String>]) -> String {
-    let mut widths: Vec<usize> = header.iter().map(|c| c.len()).collect();
-    for row in rows {
-        for (i, c) in row.iter().enumerate() {
-            widths[i] = widths[i].max(c.len());
-        }
-    }
-    let numeric: Vec<bool> = (0..header.len())
-        .map(|i| rows.iter().all(|r| r[i].parse::<f64>().is_ok()))
-        .collect();
-    let mut out = String::new();
-    push_row(&mut out, header, &widths, &numeric);
-    push_separator(&mut out, &widths);
-    for row in rows {
-        push_row(&mut out, row, &widths, &numeric);
-    }
-    out
-}
-
-fn push_row(out: &mut String, row: &[String], widths: &[usize], numeric: &[bool]) {
-    out.push('|');
-    for (i, cell) in row.iter().enumerate() {
-        if numeric[i] {
-            out.push_str(&format!(" {:>w$} |", cell, w = widths[i]));
-        } else {
-            out.push_str(&format!(" {:<w$} |", cell, w = widths[i]));
-        }
-    }
-    out.push('\n');
-}
-
-fn push_separator(out: &mut String, widths: &[usize]) {
-    out.push('|');
-    for w in widths {
-        out.push_str(&"-".repeat(w + 2));
-        out.push('|');
-    }
-    out.push('\n');
+    Some(RecallResult {
+        n_counts: recall_n_counts,
+        values: recall,
+    })
 }

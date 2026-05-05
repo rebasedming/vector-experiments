@@ -16,11 +16,28 @@
 //!    the runner-up clusters. Controlled by a fan-out cap and a distance
 //!    ratio.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use rayon::prelude::*;
 
-use super::superkmeans::batch::find_k_nearest_neighbors;
-use super::superkmeans::common::{X_BATCH_SIZE, Y_BATCH_SIZE};
-use super::superkmeans::computers::squared_l2_horizontal;
+use super::distance::{find_k_nearest_neighbors, squared_l2, X_BATCH_SIZE, Y_BATCH_SIZE};
+
+/// Reified bisection tree. Each internal node carries the routing centroids
+/// for its two children (the means produced by the parent's `balanced_bisect`).
+/// At query time we descend by picking the closer child; for top-N we use a
+/// best-first PQ traversal — same idea as SPTAG-BKT.
+pub enum BisectTree {
+    Internal {
+        left_centroid: Vec<f32>,
+        left: Box<BisectTree>,
+        right_centroid: Vec<f32>,
+        right: Box<BisectTree>,
+    },
+    Leaf {
+        cluster_id: u32,
+    },
+}
 
 /// Hierarchical balanced bisection.
 ///
@@ -36,13 +53,15 @@ pub fn hierarchical_balanced_kmeans(
     k: usize,
     n_iters_per_bisect: usize,
     seed: u64,
-) -> (Vec<f32>, Vec<u32>) {
+) -> (Vec<f32>, Vec<u32>, BisectTree) {
     assert!(k > 0);
     assert!(n >= k, "n ({n}) must be ≥ k ({k}) for hierarchical clustering");
     let mut centroids = Vec::with_capacity(k * dims);
     let mut assignments = vec![0u32; n];
     let indices: Vec<u32> = (0..n as u32).collect();
-    bisect_recurse(
+    let max_depth = (k as f32).log2().ceil() as usize + 1;
+    let mut level_ms = vec![0.0f64; max_depth];
+    let tree = bisect_recurse(
         data,
         dims,
         &indices,
@@ -52,9 +71,20 @@ pub fn hierarchical_balanced_kmeans(
         &mut centroids,
         &mut assignments,
         seed,
+        0,
+        &mut level_ms,
     );
     debug_assert_eq!(centroids.len(), k * dims);
-    (centroids, assignments)
+    let total: f64 = level_ms.iter().sum();
+    let mut summary = String::from("    hierarchical bisect by level: ");
+    for (d, ms) in level_ms.iter().enumerate() {
+        if *ms > 0.0 {
+            summary.push_str(&format!("L{}={:.1}s ", d, ms / 1000.0));
+        }
+    }
+    summary.push_str(&format!("(sum={:.1}s)", total / 1000.0));
+    eprintln!("{}", summary);
+    (centroids, assignments, tree)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,7 +98,9 @@ fn bisect_recurse(
     centroids: &mut Vec<f32>,
     assignments: &mut [u32],
     seed: u64,
-) {
+    depth: usize,
+    level_ms: &mut [f64],
+) -> BisectTree {
     if k == 1 {
         // Leaf: centroid is the mean of assigned points.
         let mut centroid = vec![0.0f32; dims];
@@ -88,7 +120,7 @@ fn bisect_recurse(
         for &i in indices {
             assignments[i as usize] = cluster_offset;
         }
-        return;
+        return BisectTree::Leaf { cluster_id: cluster_offset };
     }
 
     let k_left = k / 2;
@@ -100,7 +132,8 @@ fn bisect_recurse(
     let target_right = n_subset - target_left;
     debug_assert!(target_right >= k_right);
 
-    let (left_indices, right_indices) = balanced_bisect(
+    let bisect_t = std::time::Instant::now();
+    let (left_indices, right_indices, centroid_a, centroid_b) = balanced_bisect(
         data,
         dims,
         indices,
@@ -109,8 +142,11 @@ fn bisect_recurse(
         n_iters_per_bisect,
         seed,
     );
+    if depth < level_ms.len() {
+        level_ms[depth] += bisect_t.elapsed().as_secs_f64() * 1000.0;
+    }
 
-    bisect_recurse(
+    let left = bisect_recurse(
         data,
         dims,
         &left_indices,
@@ -120,8 +156,10 @@ fn bisect_recurse(
         centroids,
         assignments,
         seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1),
+        depth + 1,
+        level_ms,
     );
-    bisect_recurse(
+    let right = bisect_recurse(
         data,
         dims,
         &right_indices,
@@ -131,7 +169,16 @@ fn bisect_recurse(
         centroids,
         assignments,
         seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(2),
+        depth + 1,
+        level_ms,
     );
+
+    BisectTree::Internal {
+        left_centroid: centroid_a,
+        left: Box::new(left),
+        right_centroid: centroid_b,
+        right: Box::new(right),
+    }
 }
 
 /// Split a subset of points into a "left" group of exactly `target_left` points
@@ -151,7 +198,7 @@ fn balanced_bisect(
     target_right: usize,
     n_iters: usize,
     seed: u64,
-) -> (Vec<u32>, Vec<u32>) {
+) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>) {
     debug_assert_eq!(target_left + target_right, indices.len());
 
     // Initialise centroids with two reasonably far-apart points: pick one at
@@ -164,7 +211,7 @@ fn balanced_bisect(
         .par_iter()
         .map(|&i| {
             let row = &data[i as usize * dims..(i as usize + 1) * dims];
-            (squared_l2_horizontal(row0, row), i)
+            (squared_l2(row0, row), i)
         })
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(_, i)| i)
@@ -180,8 +227,8 @@ fn balanced_bisect(
             .par_iter()
             .map(|&i| {
                 let row = &data[i as usize * dims..(i as usize + 1) * dims];
-                let da = squared_l2_horizontal(row, &centroid_a);
-                let db = squared_l2_horizontal(row, &centroid_b);
+                let da = squared_l2(row, &centroid_a);
+                let db = squared_l2(row, &centroid_b);
                 (da - db, i)
             })
             .collect();
@@ -198,7 +245,7 @@ fn balanced_bisect(
 
     let left = sorted[..target_left].to_vec();
     let right = sorted[target_left..].to_vec();
-    (left, right)
+    (left, right, centroid_a, centroid_b)
 }
 
 fn recompute_centroid(data: &[f32], dims: usize, indices: &[u32], centroid: &mut [f32]) {
@@ -215,6 +262,194 @@ fn recompute_centroid(data: &[f32], dims: usize, indices: &[u32], centroid: &mut
             *v *= inv;
         }
     }
+}
+
+/// Best-first PQ traversal returning approximate top-`n` nearest leaves.
+/// Visits at most `budget` leaves; pruning stops early when the frontier's
+/// best lower bound exceeds the current Nth-best leaf distance. Distances
+/// are squared L2.
+pub fn tree_search_top_n(
+    root: &BisectTree,
+    query: &[f32],
+    n: usize,
+    budget: usize,
+) -> Vec<(f32, u32)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut frontier: BinaryHeap<FrontierEntry> = BinaryHeap::new();
+    let mut best: BinaryHeap<LeafEntry> = BinaryHeap::with_capacity(n + 1);
+
+    frontier.push(FrontierEntry {
+        neg_dist: 0.0,
+        node: root,
+    });
+
+    let mut leaves_visited = 0usize;
+    while let Some(entry) = frontier.pop() {
+        let dist = -entry.neg_dist;
+        if best.len() >= n {
+            let worst = best.peek().map(|l| l.dist).unwrap_or(f32::INFINITY);
+            if dist >= worst {
+                break;
+            }
+        }
+        if leaves_visited >= budget {
+            break;
+        }
+        match entry.node {
+            BisectTree::Leaf { cluster_id } => {
+                leaves_visited += 1;
+                if best.len() < n {
+                    best.push(LeafEntry {
+                        dist,
+                        cluster: *cluster_id,
+                    });
+                } else if dist < best.peek().unwrap().dist {
+                    best.pop();
+                    best.push(LeafEntry {
+                        dist,
+                        cluster: *cluster_id,
+                    });
+                }
+            }
+            BisectTree::Internal {
+                left_centroid,
+                left,
+                right_centroid,
+                right,
+            } => {
+                let dl = squared_l2(query, left_centroid);
+                let dr = squared_l2(query, right_centroid);
+                frontier.push(FrontierEntry {
+                    neg_dist: -dl,
+                    node: left.as_ref(),
+                });
+                frontier.push(FrontierEntry {
+                    neg_dist: -dr,
+                    node: right.as_ref(),
+                });
+            }
+        }
+    }
+
+    let mut result: Vec<(f32, u32)> = best
+        .into_iter()
+        .map(|l| (l.dist, l.cluster))
+        .collect();
+    result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    result
+}
+
+// BinaryHeap is a max-heap; we negate distance so popping gives min-distance.
+struct FrontierEntry<'a> {
+    neg_dist: f32,
+    node: &'a BisectTree,
+}
+impl<'a> PartialEq for FrontierEntry<'a> {
+    fn eq(&self, o: &Self) -> bool {
+        self.neg_dist == o.neg_dist
+    }
+}
+impl<'a> Eq for FrontierEntry<'a> {}
+impl<'a> Ord for FrontierEntry<'a> {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.neg_dist.partial_cmp(&o.neg_dist).unwrap_or(Ordering::Equal)
+    }
+}
+impl<'a> PartialOrd for FrontierEntry<'a> {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+// Max-heap by dist so peek is the worst (largest) — easy to evict.
+struct LeafEntry {
+    dist: f32,
+    cluster: u32,
+}
+impl PartialEq for LeafEntry {
+    fn eq(&self, o: &Self) -> bool {
+        self.dist == o.dist
+    }
+}
+impl Eq for LeafEntry {}
+impl Ord for LeafEntry {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.dist.partial_cmp(&o.dist).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for LeafEntry {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// Tree-routed duplication: for each doc, use best-first traversal of the
+/// bisect tree to approximate top-`max_copies` nearest centroids in O(log k)
+/// per query instead of O(k). Falls back to brute-force semantics on the
+/// returned candidate set (same ratio + max-replicas filter as
+/// `duplicate_assignments`).
+#[allow(clippy::too_many_arguments)]
+pub fn duplicate_assignments_via_tree(
+    data: &[f32],
+    n: usize,
+    dims: usize,
+    centroids: &[f32],
+    n_clusters: usize,
+    primary: &[u32],
+    max_copies: usize,
+    ratio_threshold: f32,
+    tree: &BisectTree,
+    budget_factor: usize,
+) -> Vec<Vec<u32>> {
+    if max_copies <= 1 || ratio_threshold <= 1.0 {
+        return primary.iter().map(|&c| vec![c]).collect();
+    }
+    let max_copies = max_copies.min(n_clusters);
+    let request = (max_copies + 1).min(n_clusters);
+    let budget = (max_copies * budget_factor.max(1)).max(request);
+    let ratio_sq = ratio_threshold * ratio_threshold;
+
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let query = &data[i * dims..(i + 1) * dims];
+            let neighbors = tree_search_top_n(tree, query, request, budget);
+            let primary_c = primary[i];
+            let mut clusters = Vec::with_capacity(max_copies);
+            clusters.push(primary_c);
+
+            // Primary distance for the ratio cap. If primary isn't in the
+            // tree's top-N (can happen when balance forced the doc into a
+            // far leaf), compute it directly.
+            let primary_dist = neighbors
+                .iter()
+                .find(|(_, c)| *c == primary_c)
+                .map(|(d, _)| *d)
+                .unwrap_or_else(|| {
+                    let c = &centroids
+                        [primary_c as usize * dims..(primary_c as usize + 1) * dims];
+                    squared_l2(query, c)
+                });
+            let cap = primary_dist * ratio_sq;
+
+            for (d, c) in &neighbors {
+                if *c == primary_c {
+                    continue;
+                }
+                if *d <= cap {
+                    clusters.push(*c);
+                    if clusters.len() >= max_copies {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            clusters
+        })
+        .collect()
 }
 
 /// SPANN-style boundary-point duplication.

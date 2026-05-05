@@ -1,4 +1,4 @@
+pub mod distance;
 pub mod experiment;
 pub mod spann;
-pub mod superkmeans;
-pub mod tantivy;
+pub mod vanilla;
