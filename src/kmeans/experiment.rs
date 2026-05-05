@@ -13,9 +13,25 @@ use crate::kmeans::spann::{
 use crate::kmeans::superkmeans::batch::find_k_nearest_neighbors;
 use crate::kmeans::superkmeans::common::{X_BATCH_SIZE, Y_BATCH_SIZE};
 use crate::kmeans::superkmeans::{SuperKMeans, SuperKMeansConfig};
+use crate::kmeans::tantivy;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum Variant {
+    /// Faithful 1:1 port of `cwida/SuperKMeans` (PDX layout + ADSampling
+    /// pruning gated behind `--superkmeans`; vanilla Lloyd's otherwise).
+    Superkmeans,
+    /// Lifted from `tantivy/src/vector/cluster/kmeans.rs` (turboquant
+    /// branch). FAISS-style sampled Lloyd's with farthest-point empty-
+    /// cluster reseeding and best-of-N restarts.
+    Tantivy,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct KMeansExperiment {
+    /// Which k-means implementation to run.
+    #[arg(long, value_enum, default_value_t = Variant::Superkmeans)]
+    pub variant: Variant,
+
     /// Number of clusters to train.
     #[arg(long, default_value_t = 1024)]
     pub k: usize,
@@ -71,6 +87,16 @@ pub struct KMeansExperiment {
     #[arg(long, default_value_t = 1.0)]
     pub duplicate_ratio: f32,
 
+    /// (tantivy variant only) Number of independent restarts; the run with
+    /// the lowest WCSS objective is kept.
+    #[arg(long, default_value_t = 1)]
+    pub nredo: usize,
+
+    /// (tantivy variant only) Spherical k-means: normalize centroids to unit
+    /// length each iteration. Useful for cosine-style retrieval.
+    #[arg(long, default_value_t = false)]
+    pub spherical: bool,
+
     /// Recall@k values to evaluate. Comma-separated; e.g. `1,10,100`.
     #[arg(long, value_delimiter = ',', default_values_t = vec![1usize, 10, 100])]
     pub recall_k: Vec<usize>,
@@ -125,53 +151,24 @@ impl Experiment for KMeansExperiment {
             ]);
             (c, a)
         } else {
-            // Vanilla Lloyd's by default; `--superkmeans` flips on rotation,
-            // PDX + ADSampling pruning, and the convergence-based early stop.
-            let cfg = SuperKMeansConfig {
-                iters: self.iters,
-                sampling_fraction: self.sampling_fraction,
-                max_points_per_cluster: self.max_points_per_cluster,
-                seed: self.seed,
-                use_blas_only: !self.superkmeans,
-                early_termination: self.superkmeans,
-                data_already_rotated: !self.superkmeans,
-                verbose: self.verbose,
-                ..SuperKMeansConfig::default()
-            };
-            let t_setup = Instant::now();
-            let mut km = SuperKMeans::new(self.k, dims, cfg);
-            setup_ms = t_setup.elapsed().as_secs_f64() * 1000.0;
-
-            let t_train = Instant::now();
-            let centroids = km.train(&flat, n, None, 0);
-            train_ms = t_train.elapsed().as_secs_f64() * 1000.0;
-
-            for stat in &km.iteration_stats {
-                output.push_row([
-                    stat.iteration.to_string(),
-                    format!("{:.4}", stat.objective),
-                    format!("{:.6}", stat.shift),
-                    stat.split.to_string(),
-                    format!("{:.4}", stat.not_pruned_pct),
-                    stat.partial_d.to_string(),
-                    stat.is_gemm_only.to_string(),
-                    format!("{:.1}", stat.duration_ms),
-                ]);
+            match self.variant {
+                Variant::Superkmeans => self.run_superkmeans(
+                    &flat,
+                    n,
+                    dims,
+                    &mut output,
+                    &mut setup_ms,
+                    &mut train_ms,
+                    &mut assign_ms,
+                ),
+                Variant::Tantivy => self.run_tantivy(
+                    &data.docs,
+                    n,
+                    dims,
+                    &mut output,
+                    &mut train_ms,
+                ),
             }
-
-            // With --superkmeans we use the pruning fast-path
-            // (assign_training_points), which on non-AMX hardware can be
-            // dramatically faster than brute-force; without the flag we fall
-            // back to brute-force `assign` (the pruning ratios assume the
-            // rotation has been applied, so they're not valid otherwise).
-            let t_assign = Instant::now();
-            let primary = if self.superkmeans {
-                km.assign_training_points(&flat, &centroids, n, self.k)
-            } else {
-                km.assign(&flat, &centroids, n, self.k)
-            };
-            assign_ms = t_assign.elapsed().as_secs_f64() * 1000.0;
-            (centroids, primary)
         };
 
         // -------- 2. Primary balance summary --------
@@ -283,6 +280,110 @@ impl Experiment for KMeansExperiment {
             format!("{:.1}", total_ms),
         ]);
         Ok(output)
+    }
+}
+
+impl KMeansExperiment {
+    fn run_superkmeans(
+        &self,
+        flat: &[f32],
+        n: usize,
+        dims: usize,
+        output: &mut ExperimentOutput,
+        setup_ms: &mut f64,
+        train_ms: &mut f64,
+        assign_ms: &mut f64,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let cfg = SuperKMeansConfig {
+            iters: self.iters,
+            sampling_fraction: self.sampling_fraction,
+            max_points_per_cluster: self.max_points_per_cluster,
+            seed: self.seed,
+            use_blas_only: !self.superkmeans,
+            early_termination: self.superkmeans,
+            data_already_rotated: !self.superkmeans,
+            verbose: self.verbose,
+            ..SuperKMeansConfig::default()
+        };
+        let t_setup = Instant::now();
+        let mut km = SuperKMeans::new(self.k, dims, cfg);
+        *setup_ms = t_setup.elapsed().as_secs_f64() * 1000.0;
+
+        let t_train = Instant::now();
+        let centroids = km.train(flat, n, None, 0);
+        *train_ms = t_train.elapsed().as_secs_f64() * 1000.0;
+
+        for stat in &km.iteration_stats {
+            output.push_row([
+                stat.iteration.to_string(),
+                format!("{:.4}", stat.objective),
+                format!("{:.6}", stat.shift),
+                stat.split.to_string(),
+                format!("{:.4}", stat.not_pruned_pct),
+                stat.partial_d.to_string(),
+                stat.is_gemm_only.to_string(),
+                format!("{:.1}", stat.duration_ms),
+            ]);
+        }
+
+        // With --superkmeans we use the pruning fast-path
+        // (assign_training_points), which on non-AMX hardware can be
+        // dramatically faster than brute-force; without the flag we fall
+        // back to brute-force `assign` (the pruning ratios assume the
+        // rotation has been applied, so they're not valid otherwise).
+        let t_assign = Instant::now();
+        let primary = if self.superkmeans {
+            km.assign_training_points(flat, &centroids, n, self.k)
+        } else {
+            km.assign(flat, &centroids, n, self.k)
+        };
+        *assign_ms = t_assign.elapsed().as_secs_f64() * 1000.0;
+        (centroids, primary)
+    }
+
+    fn run_tantivy(
+        &self,
+        docs: &[Vec<f32>],
+        n: usize,
+        dims: usize,
+        output: &mut ExperimentOutput,
+        train_ms: &mut f64,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let cfg = tantivy::KMeansConfig {
+            niter: self.iters as usize,
+            nredo: self.nredo,
+            seed: self.seed,
+            spherical: self.spherical,
+            max_points_per_centroid: self.max_points_per_cluster as usize,
+            decode_block_size: 32_768,
+        };
+        let t = Instant::now();
+        let result = tantivy::run_kmeans_with_config(docs, self.k, cfg);
+        *train_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let mut centroids = Vec::with_capacity(self.k * dims);
+        for c in &result.centroids {
+            centroids.extend_from_slice(c);
+        }
+        let assignments: Vec<u32> = result.assignments.iter().map(|&a| a as u32).collect();
+        debug_assert_eq!(assignments.len(), n);
+
+        let avg_iter_ms = if self.iters > 0 {
+            *train_ms / self.iters as f64
+        } else {
+            0.0
+        };
+        output.push_row([
+            "TANTIVY".to_string(),
+            format!("{:.4}", result.objective),
+            format!("nredo={}", self.nredo),
+            format!("iters={}", self.iters),
+            String::new(),
+            String::new(),
+            format!("avg_iter={:.0}ms", avg_iter_ms),
+            format!("{:.1}", *train_ms),
+        ]);
+        (centroids, assignments)
     }
 }
 
